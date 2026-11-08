@@ -47,6 +47,19 @@ cargo run --bin socks6_client
 The server defaults to `127.0.0.1:1086`. This reference backend opens ordinary
 system TCP and UDP sockets; it is not a Lokinet daemon.
 
+On Unix, the same client API can use a local IPC socket instead:
+
+```rust,no_run
+use socks6::Client;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = Client::connect_unix("/run/example-socks6/control.sock").await?;
+    println!("{:?}", proxy.query_capabilities().await?);
+    Ok(())
+}
+```
+
 SOCKS6 is an experimental protocol, not a claim of compatibility with another
 SOCKS6 specification. See [SPEC.md](SPEC.md) for the wire contract and
 non-goals.
