@@ -53,7 +53,7 @@ use socks6::Client;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proxy = Client::connect_unix("/run/example-socks6/control.sock").await?;
+    let proxy = Client::connect_unix("/run/example-socks6/proxy.socks6").await?;
     println!("{:?}", proxy.query_capabilities().await?);
     Ok(())
 }
