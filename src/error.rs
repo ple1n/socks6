@@ -1,29 +1,21 @@
+use crate::frame::ErrorCode;
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 pub enum Error {
-    #[error("IO error: {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Binrw error: {0}")]
-    Binrw(#[from] binrw::Error),
-
-    #[error("Protocol error: {0}")]
+    #[error("protocol error: {0}")]
     Protocol(String),
 
-    #[error("Buffer too short")]
-    BufferTooShort,
+    #[error("frame size {size} exceeds the negotiated limit {limit}")]
+    FrameTooLarge { size: usize, limit: usize },
 
-    #[error("Invalid endpoint type: {0}")]
-    InvalidEndpointType(u8),
+    #[error("server returned {code:?}: {message}")]
+    Remote { code: ErrorCode, message: String },
 
-    #[error("Invalid frame opcode: {0}")]
-    InvalidOpcode(u8),
-
-    #[error("Unsupported endpoint: {0:?}")]
-    UnsupportedEndpoint(String),
-
-    #[error("Connection closed")]
+    #[error("connection closed")]
     ConnectionClosed,
 }
 

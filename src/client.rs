@@ -1,169 +1,294 @@
+use crate::backend::{BoxStream, Datagram};
 use crate::endpoint::Endpoint;
 use crate::error::{Error, Result};
-use crate::frame::{Frame, Packet};
-use bytes::Bytes;
+use crate::frame::{
+    Capabilities, Frame, ServiceStatus, MAX_DATAGRAM_SIZE, MAX_FRAME_SIZE, PROTOCOL_VERSION,
+};
+use async_trait::async_trait;
+use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::Mutex;
 
-#[derive(Debug)]
-enum ControlResponse {
-    Capabilities(Vec<Endpoint>),
-    BindResponse {
-        binding_id: u32,
-        assigned_endpoint: Endpoint,
-    },
-    Pong,
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
+#[async_trait]
+pub trait Connector: Send + Sync + 'static {
+    async fn open(&self) -> io::Result<BoxStream>;
 }
 
-pub struct Client {
-    writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-    control_tx: Arc<Mutex<Option<oneshot::Sender<ControlResponse>>>>,
-    inbound_rx: mpsc::Receiver<Packet>,
+#[derive(Clone)]
+pub struct TcpConnector {
+    address: SocketAddr,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoundSession {
-    pub binding_id: u32,
-    pub assigned_endpoint: Endpoint,
-}
-
-impl BoundSession {
-    /// Send packet originating from this binding to a target endpoint
-    pub async fn send_to(&self, client: &Client, target: Endpoint, payload: Bytes) -> Result<()> {
-        client.send_to(self.binding_id, target, payload).await
+impl TcpConnector {
+    pub fn new(address: SocketAddr) -> Self {
+        Self { address }
     }
+}
+
+#[async_trait]
+impl Connector for TcpConnector {
+    async fn open(&self) -> io::Result<BoxStream> {
+        Ok(Box::new(TcpStream::connect(self.address).await?))
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct UnixConnector {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl UnixConnector {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+#[cfg(unix)]
+#[async_trait]
+impl Connector for UnixConnector {
+    async fn open(&self) -> io::Result<BoxStream> {
+        Ok(Box::new(UnixStream::connect(&self.path).await?))
+    }
+}
+
+#[derive(Clone)]
+pub struct Client {
+    connector: Arc<dyn Connector>,
 }
 
 impl Client {
-    /// Connect to a SOCKS6 server
-    pub async fn connect(server_addr: SocketAddr) -> Result<Self> {
-        let stream = TcpStream::connect(server_addr).await?;
-        let (mut reader, writer) = stream.into_split();
-        let writer = Arc::new(Mutex::new(writer));
+    pub fn from_connector<C>(connector: C) -> Self
+    where
+        C: Connector,
+    {
+        Self {
+            connector: Arc::new(connector),
+        }
+    }
 
-        let control_tx: Arc<Mutex<Option<oneshot::Sender<ControlResponse>>>> =
-            Arc::new(Mutex::new(None));
-        let control_tx_clone = control_tx.clone();
+    pub async fn connect(address: SocketAddr) -> Result<Self> {
+        let client = Self::from_connector(TcpConnector::new(address));
+        client.query_capabilities().await?;
+        Ok(client)
+    }
 
-        let (inbound_tx, inbound_rx) = mpsc::channel::<Packet>(100);
+    #[cfg(unix)]
+    pub async fn connect_unix(path: impl Into<PathBuf>) -> Result<Self> {
+        let client = Self::from_connector(UnixConnector::new(path));
+        client.query_capabilities().await?;
+        Ok(client)
+    }
 
-        tokio::spawn(async move {
-            loop {
-                match Frame::read_from(&mut reader).await {
-                    Ok(Frame::Packet(pkt)) => {
-                        if inbound_tx.send(pkt).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(Frame::Capabilities { endpoints }) => {
-                        let mut slot = control_tx_clone.lock().await;
-                        if let Some(sender) = slot.take() {
-                            let _ = sender.send(ControlResponse::Capabilities(endpoints));
-                        }
-                    }
-                    Ok(Frame::BindResponse {
-                        binding_id,
-                        assigned_endpoint,
-                    }) => {
-                        let mut slot = control_tx_clone.lock().await;
-                        if let Some(sender) = slot.take() {
-                            let _ = sender.send(ControlResponse::BindResponse {
-                                binding_id,
-                                assigned_endpoint,
-                            });
-                        }
-                    }
-                    Ok(Frame::Pong) => {
-                        let mut slot = control_tx_clone.lock().await;
-                        if let Some(sender) = slot.take() {
-                            let _ = sender.send(ControlResponse::Pong);
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
+    pub async fn query_capabilities(&self) -> Result<Capabilities> {
+        let (_, capabilities, _) = self.open_session().await?;
+        Ok(capabilities)
+    }
+
+    pub async fn query_status(&self) -> Result<ServiceStatus> {
+        let (mut stream, _, max_frame_size) = self.open_session().await?;
+        Frame::StatusRequest.write_to(&mut stream).await?;
+        match Frame::read_from_with_limit(&mut stream, max_frame_size).await? {
+            Frame::Status(status) => Ok(status),
+            Frame::Error { code, message } => Err(Error::Remote { code, message }),
+            _ => Err(Error::Protocol(
+                "expected a Status response from the server".to_owned(),
+            )),
+        }
+    }
+
+    pub async fn ping(&self) -> Result<()> {
+        let (mut stream, _, max_frame_size) = self.open_session().await?;
+        Frame::Ping.write_to(&mut stream).await?;
+        match Frame::read_from_with_limit(&mut stream, max_frame_size).await? {
+            Frame::Pong => Ok(()),
+            Frame::Error { code, message } => Err(Error::Remote { code, message }),
+            _ => Err(Error::Protocol("expected Pong from the server".to_owned())),
+        }
+    }
+
+    pub async fn connect_tcp(&self, target: Endpoint) -> Result<TcpConnection> {
+        let (mut stream, _, max_frame_size) = self.open_session().await?;
+        Frame::OpenTcp {
+            target: target.clone(),
+        }
+        .write_to(&mut stream)
+        .await?;
+        match Frame::read_from_with_limit(&mut stream, max_frame_size).await? {
+            Frame::TcpReady { source } => Ok(TcpConnection {
+                stream,
+                target,
+                source,
+            }),
+            Frame::Error { code, message } => Err(Error::Remote { code, message }),
+            _ => Err(Error::Protocol(
+                "expected TcpReady from the server".to_owned(),
+            )),
+        }
+    }
+
+    pub async fn open_udp(&self, bind: Option<Endpoint>) -> Result<UdpAssociation> {
+        let (mut stream, capabilities, max_frame_size) = self.open_session().await?;
+        if !capabilities.udp_associate {
+            return Err(Error::Remote {
+                code: crate::frame::ErrorCode::Unsupported,
+                message: "server does not support UDP associations".to_owned(),
+            });
+        }
+        Frame::OpenUdp { bind }.write_to(&mut stream).await?;
+        let bound_endpoint = match Frame::read_from_with_limit(&mut stream, max_frame_size).await? {
+            Frame::UdpReady { bound } => bound,
+            Frame::Error { code, message } => return Err(Error::Remote { code, message }),
+            _ => {
+                return Err(Error::Protocol(
+                    "expected UdpReady from the server".to_owned(),
+                ));
             }
-        });
-
-        Ok(Self {
-            writer,
-            control_tx,
-            inbound_rx,
+        };
+        let datagram_limit = (capabilities.max_datagram_size as usize).min(MAX_DATAGRAM_SIZE);
+        let (reader, writer) = tokio::io::split(stream);
+        Ok(UdpAssociation {
+            reader: Mutex::new(reader),
+            writer: Mutex::new(writer),
+            bound_endpoint,
+            max_frame_size,
+            datagram_limit,
         })
     }
 
-    /// Query available capabilities and endpoints supported by server
-    pub async fn query_capabilities(&self) -> Result<Vec<Endpoint>> {
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut slot = self.control_tx.lock().await;
-            *slot = Some(tx);
+    async fn open_session(&self) -> Result<(BoxStream, Capabilities, usize)> {
+        let mut stream = self.connector.open().await?;
+        Frame::Hello {
+            version: PROTOCOL_VERSION,
+            max_frame_size: MAX_FRAME_SIZE as u32,
         }
-        {
-            let mut w = self.writer.lock().await;
-            Frame::QueryCapabilities.write_to(&mut *w).await?;
+        .write_to(&mut stream)
+        .await?;
+        match Frame::read_from(&mut stream).await? {
+            Frame::Welcome {
+                version,
+                max_frame_size,
+                capabilities,
+            } if version == PROTOCOL_VERSION => {
+                let negotiated = (max_frame_size as usize).min(MAX_FRAME_SIZE);
+                if negotiated < 128 {
+                    return Err(Error::Protocol(
+                        "server negotiated an invalid frame limit".to_owned(),
+                    ));
+                }
+                Ok((stream, capabilities, negotiated))
+            }
+            Frame::Welcome { version, .. } => Err(Error::Protocol(format!(
+                "server selected unsupported protocol version {version}"
+            ))),
+            Frame::Error { code, message } => Err(Error::Remote { code, message }),
+            _ => Err(Error::Protocol(
+                "expected Welcome from the server".to_owned(),
+            )),
         }
-        match rx.await.map_err(|_| Error::ConnectionClosed)? {
-            ControlResponse::Capabilities(eps) => Ok(eps),
-            other => Err(Error::Protocol(format!("Unexpected response: {:?}", other))),
+    }
+}
+
+pub struct TcpConnection {
+    stream: BoxStream,
+    target: Endpoint,
+    source: Option<Endpoint>,
+}
+
+impl TcpConnection {
+    pub fn target(&self) -> &Endpoint {
+        &self.target
+    }
+
+    pub fn source(&self) -> Option<&Endpoint> {
+        self.source.as_ref()
+    }
+
+    pub fn info(&self) -> String {
+        format!("SOCKS6 TCP {}", self.target)
+    }
+}
+
+impl AsyncRead for TcpConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TcpConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.stream).poll_shutdown(cx)
+    }
+}
+
+pub struct UdpAssociation {
+    reader: Mutex<ReadHalf<BoxStream>>,
+    writer: Mutex<WriteHalf<BoxStream>>,
+    bound_endpoint: Option<Endpoint>,
+    max_frame_size: usize,
+    datagram_limit: usize,
+}
+
+impl UdpAssociation {
+    pub fn bound_endpoint(&self) -> Option<&Endpoint> {
+        self.bound_endpoint.as_ref()
+    }
+
+    pub async fn send_to(&self, endpoint: Endpoint, payload: Vec<u8>) -> Result<()> {
+        if payload.len() > self.datagram_limit {
+            return Err(Error::FrameTooLarge {
+                size: payload.len(),
+                limit: self.datagram_limit,
+            });
+        }
+        Frame::Datagram { endpoint, payload }
+            .write_to(&mut *self.writer.lock().await)
+            .await
+    }
+
+    pub async fn recv_from(&self) -> Result<Datagram> {
+        match Frame::read_from_with_limit(&mut *self.reader.lock().await, self.max_frame_size)
+            .await?
+        {
+            Frame::Datagram { endpoint, payload } => Ok(Datagram { endpoint, payload }),
+            Frame::Error { code, message } => Err(Error::Remote { code, message }),
+            _ => Err(Error::Protocol(
+                "expected a UDP datagram from the server".to_owned(),
+            )),
         }
     }
 
-    /// Request a public ingress binding on the active connection
-    pub async fn bind(&self, desired: Option<Endpoint>) -> Result<BoundSession> {
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut slot = self.control_tx.lock().await;
-            *slot = Some(tx);
-        }
-        {
-            let mut w = self.writer.lock().await;
-            Frame::BindRequest { desired }.write_to(&mut *w).await?;
-        }
-        match rx.await.map_err(|_| Error::ConnectionClosed)? {
-            ControlResponse::BindResponse {
-                binding_id,
-                assigned_endpoint,
-            } => Ok(BoundSession {
-                binding_id,
-                assigned_endpoint,
-            }),
-            other => Err(Error::Protocol(format!("Unexpected response: {:?}", other))),
-        }
-    }
-
-    /// Send ping to server and await pong
-    pub async fn ping(&self) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut slot = self.control_tx.lock().await;
-            *slot = Some(tx);
-        }
-        {
-            let mut w = self.writer.lock().await;
-            Frame::Ping.write_to(&mut *w).await?;
-        }
-        match rx.await.map_err(|_| Error::ConnectionClosed)? {
-            ControlResponse::Pong => Ok(()),
-            other => Err(Error::Protocol(format!("Unexpected response: {:?}", other))),
-        }
-    }
-
-    /// Send packet through a binding to target endpoint
-    pub async fn send_to(&self, binding_id: u32, target: Endpoint, payload: Bytes) -> Result<()> {
-        let frame = Frame::Packet(Packet {
-            binding_id,
-            peer_endpoint: target,
-            payload,
-        });
-        let mut w = self.writer.lock().await;
-        frame.write_to(&mut *w).await
-    }
-
-    /// Receive next inbound packet
-    pub async fn recv_from(&mut self) -> Option<Packet> {
-        self.inbound_rx.recv().await
+    pub async fn close(&self) -> Result<()> {
+        Frame::Close
+            .write_to(&mut *self.writer.lock().await)
+            .await?;
+        self.writer.lock().await.shutdown().await?;
+        Ok(())
     }
 }

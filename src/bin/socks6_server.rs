@@ -1,30 +1,19 @@
-use socks6::{Endpoint, Server};
+use socks6::{Server, SocketBackend};
 use std::env;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-
-    let bind_addr: SocketAddr = env::args()
+    let address: SocketAddr = env::args()
         .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:1086".to_string())
+        .unwrap_or_else(|| "127.0.0.1:1086".to_owned())
         .parse()?;
-
-    // Advertise supported endpoint formats
-    let capabilities = vec![
-        Endpoint::Socket("0.0.0.0:0".parse()?),
-        Endpoint::Ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-        Endpoint::Lokinet([0u8; 32]),
-        Endpoint::Domain("example.loki".to_string(), 0),
-    ];
-
-    let server = Arc::new(Server::new(bind_addr, capabilities));
-    let listener = TcpListener::bind(bind_addr).await?;
-    println!("SOCKS6 server running on {}", bind_addr);
-
+    let listener = TcpListener::bind(address).await?;
+    let server = Arc::new(Server::new(SocketBackend));
+    tracing::info!(%address, "SOCKS6 test server listening");
     server.run(listener).await?;
     Ok(())
 }

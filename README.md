@@ -1,51 +1,62 @@
-# socks6
+# SOCKS6
 
-An experimental Rust library and pair of command-line programs implementing a
-framed client/server control protocol with UDP packet forwarding.
+SOCKS6 is an independent Rust crate and experimental wire protocol for
+requesting TCP streams and UDP associations from a proxy backend. It does not
+depend on nsproxy, Lokinet, Linux namespaces, or a particular network
+transport.
 
-The crate currently provides:
+The crate provides:
 
-- Async client and server APIs built on Tokio.
-- Length-prefixed TCP frames for capability queries, UDP binding requests,
-  packet forwarding, and ping/pong.
-- Endpoint and frame binary codecs.
-- `socks6_client` and `socks6_server` example programs.
+- A versioned, length-framed protocol that can run over TCP, Unix-domain
+streams, or another reliable byte stream.
+- A generic `Backend` interface for TCP connects, UDP associations, endpoint
+capabilities, and service status.
+- A `Client` API for opening TCP streams and bidirectional UDP associations.
+- TCP and Unix-domain server listeners.
+- A direct-socket backend for examples and protocol tests.
 
-This is an early prototype, not a complete SOCKS6 or NAT-traversal
-implementation. The server currently forwards only socket endpoints and binds
-UDP sockets locally; it does not discover or allocate public NAT mappings.
-Other endpoint variants are represented by the codec but are not implemented
-for packet forwarding. See [SPEC.md](SPEC.md) for the draft design.
+Lokinet integration belongs in a separate adapter that implements `Backend`.
+That keeps the protocol reusable and lets each backend advertise only the
+endpoint and operation types it actually supports.
 
-## Library usage
+## Example
 
 ```rust,no_run
-use bytes::Bytes;
 use socks6::{Client, Endpoint};
 use std::net::SocketAddr;
+use tokio::io::AsyncWriteExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let server: SocketAddr = "127.0.0.1:1086".parse()?;
-    let client = Client::connect(server).await?;
-    let binding = client.bind(None).await?;
-    let target = Endpoint::Socket("127.0.0.1:9000".parse()?);
-    binding
-        .send_to(&client, target, Bytes::from_static(b"hello"))
+    let proxy = Client::connect("127.0.0.1:1086".parse::<SocketAddr>()?).await?;
+    let mut stream = proxy
+        .connect_tcp(Endpoint::Domain("example.com".to_owned(), 443))
         .await?;
+    stream.write_all(b"request").await?;
     Ok(())
 }
 ```
 
-The client and server programs can be started with:
+Run the reference direct-socket server and client with:
 
 ```sh
 cargo run --bin socks6_server
 cargo run --bin socks6_client
 ```
 
-Both default to the control address `127.0.0.1:1086`. Pass a different address
-as the first argument to either program.
+The server defaults to `127.0.0.1:1086`. This reference backend opens ordinary
+system TCP and UDP sockets; it is not a Lokinet daemon.
+
+SOCKS6 is an experimental protocol, not a claim of compatibility with another
+SOCKS6 specification. See [SPEC.md](SPEC.md) for the wire contract and
+non-goals.
+
+## Development
+
+```sh
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
 
 ## License
 

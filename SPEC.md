@@ -1,103 +1,157 @@
-# SOCKS6: Minimal Public Unreliable Packet Proxy Protocol
-*Informal Architecture & Protocol Specification (Draft)*
+# SOCKS6 protocol
 
-## 1. Scope & Objective
+Version 1 is an experimental, backend-neutral protocol for requesting TCP
+streams and UDP associations from a proxy service. The Rust crate is the
+reference implementation; this document defines the wire format independently
+of that implementation.
 
-**socks6** is an independent, minimal, public protocol designed to establish an application-to-application interface for **NAT-capable, unreliable packet proxying**.
+SOCKS6 is not tied to nsproxy, Lokinet, a particular operating system, or one
+transport. A server may expose the protocol over any reliable byte stream. The
+reference crate supports TCP and Unix-domain streams.
 
-Key principles:
-1. **Completely Standalone:** No dependencies on `nsp3`, Linux kernel namespaces, or proprietary proxy backends.
-2. **UDP-Analog Programming Model:** Works naturally like a datagram interface (`send_to` / `recv_from`) without forcing connection state or reliable stream overhead onto the wire.
-3. **Peer Transport Agnostic:** The protocol does not mandate or implement any specific network transport (unlike WireGuard, OpenVPN, or custom tunneling overlays). socks6 defines strictly a clean local wire format and framing contract between application and proxy daemon. How packets transit over wide-area networks or tunnels is left entirely to VPN vendors, overlay daemons, or custom proxy implementations.
-4. **Minimal Overhead at a Lower Layer:** Operates at a low layer directly on unreliable packets/datagrams. Eliminates unnecessary protocol layering, stream reassembly, and connection-tracking bloat, providing near-zero-copy framing.
-5. **NAT Traversal & Inbound Reachability:** Designed specifically so applications behind NAT can acquire public/routable presence, enable peer-to-peer NAT hole-punching to remote hosts (e.g. UDP NAT traversal), and receive inbound unsolicited/solicited packets.
-6. **General Packet / Protocol Agnostic Endpoints:** While UDP is a primary, first-class use case, endpoints are abstract network identifiers. The protocol natively extends to arbitrary network/transport layer addressing (bare IP packets, overlay networks like Lokinet, etc.).
+## Design contract
 
----
+- **One connection, one operation.** Each control connection opens one TCP
+  stream, one UDP association, or one short-lived status/ping request. Flow
+  identity is the transport connection, so version 1 needs no request IDs or
+  global flow table.
+- **TCP stays a stream.** After a successful TCP-open response, the same
+  transport connection carries unframed, bidirectional bytes. Closing either
+  side's write half propagates as a TCP half-close.
+- **UDP stays datagrams.** A UDP association uses SOCKS6 frames for each
+  datagram, preserving message boundaries and the peer endpoint.
+- **Backends own network semantics.** Endpoint resolution, routing, binding,
+  and reachability belong to the backend. Capabilities describe what that
+  backend actually implements.
+- **Disconnect releases resources.** EOF or `Close` tears down the operation
+  and its backend resources.
 
-## 2. Core Concepts: Endpoints & Bindings
+Version 1 does not define NAT discovery, hole punching, a public mapping
+service, raw IP packet injection, authentication, or unreliable transport.
+Those are separate extensions, not implied by endpoint encoding.
 
-### 2.1 What is an Endpoint?
-An **Endpoint** is a typed address descriptor recognized mutually by the client application and the socks6 proxy daemon.
+## Framing
 
-Endpoints describe destination targets or local source identities:
-- **`UDP Socket Endpoint` (`IpAddr:Port`):** Standard IPv4/IPv6 socket target (e.g. `198.51.100.10:51820`).
-- **`Bare IP Endpoint` (`IpAddr` / `CIDR`):** Raw L3 network endpoints for tunneling or routing raw IP packets (where L4 protocols such as ICMP, WireGuard, ESP, or custom protocols are encapsulated within the packet payload).
-- **`Overlay / Cryptographic Endpoint` (e.g., `Lokinet Addr`, `.loki` / public key):** Decentralized onion-routing / overlay network identities.
-- **`Domain Endpoint` (`FQDN:Port`):** Name-based endpoint deferred for remote resolution by the proxy.
-
-### 2.2 Endpoint Advertisement (`Available Endpoints`)
-Upon session initialization, the proxy **informs the client of available upstream endpoints and supported endpoint types**.
-- The proxy advertises its capabilities (e.g., supported address families, overlay network bindings, allocated relay interfaces).
-- The client learns what network realms it can route into and what external addresses the proxy can allocate on its behalf.
-
-### 2.3 Bindings & Inbound Ingress
-To support NAT traversal, an endpoint is not just an egress gateway—it is an **inbound binding**:
-- The proxy opens or assigns an ingress interface/port on an advertised endpoint family.
-- The proxy returns the allocated **External Endpoint Identifier** to the client.
-- The client shares this external endpoint with peers (e.g. via signaling, out-of-band rendezvous, or STUN-style discovery) to facilitate direct NAT punching or relaying.
-
----
-
-## 3. Protocol Operation
-
-The interaction between application and proxy follows a lightweight four-phase lifecycle:
-
-### Phase 1: Handshake & Capability Discovery
-1. The client connects to the socks6 control channel (local IPC, UNIX domain socket, or TCP/UDP socket).
-2. The proxy advertises its **Available Endpoints**:
-   - Supported address types (IPv4, IPv6, Bare IP, Lokinet, etc.).
-   - Available egress and ingress interfaces.
-   - NAT capability flags (Full Cone, Restricted, Symmetric relaying, raw socket support).
-
-### Phase 2: Ingress Allocation / Binding (Optional for egress-only)
-1. The client requests a binding on a specified endpoint type:
-   - *Example:* "Allocate an inbound UDP-capable endpoint" or "Bind Lokinet address".
-2. The proxy allocates the binding and returns the **Public / External Endpoint** (`allocated_endpoint`).
-3. The proxy configures its NAT table to associate incoming datagrams received on this binding back to the client's session.
-
-### Phase 3: Packet Exchange (`send_to` / `recv_from`)
-Once established, packet transfer is framed with minimal encapsulation:
+Every control message is sent as:
 
 ```text
-+-----------------------+-----------------------+-----------------------+
-|  Source Endpoint ID   |  Target Endpoint ID   |     Payload Data      |
-|     (or Flags)        |   (Type + Address)    |       (Binary)        |
-+-----------------------+-----------------------+-----------------------+
+u32 body_length (big-endian)
+byte[body_length] body
 ```
 
-- **Egress (`send_to`):**
-  - Application supplies: `from_endpoint` (optional/default), `target_endpoint`, and raw payload.
-  - Proxy transmits the packet out to the network through the corresponding physical/overlay interface.
-  - For NAT hole-punching: Outbound packets prime the NAT state on both the proxy and any intermediate firewalls.
+The body begins with:
 
-- **Ingress (`recv_from`):**
-  - Remote peers transmit packets directed to the proxy's advertised binding.
-  - Proxy demultiplexes the packet using the flow table / binding ID.
-  - Proxy forwards the packet to the client along with the sender's origin `from_endpoint`.
+```text
+byte[2] magic = "S6"
+u16 protocol_version (big-endian)
+u8 opcode
+opcode-specific fields
+```
 
-### Phase 4: Teardown & Keep-alive
-- Unreliable sessions maintain soft-state timers.
-- Keep-alive pings can be emitted if needed to maintain NAT bindings across stateful firewalls.
-- Explicit session closure releases all associated proxy sockets, NAT pins, and virtual addresses immediately.
+Version 1 uses the field encodings below. Integers are unsigned and
+big-endian. Strings are UTF-8 preceded by a `u16` byte length. Byte strings
+are preceded by a `u32` length. Booleans are one byte (`0` or `1`). Optional
+values are a one-byte presence flag followed by the value when present.
+Decoders reject truncated frames, unknown tags, invalid UTF-8, and trailing
+bytes.
 
----
+The maximum body size is 1 MiB. A peer advertises its limit in the handshake;
+the negotiated limit is the smaller value. UDP payloads are limited to 65,507
+bytes and must also fit in the frame limit.
 
-## 4. NAT Traversal & Hole-Punching Mechanics
+## Handshake and capabilities
 
-The primary motivator for socks6 over older protocols is high-performance, low-friction UDP-analog NAT traversal:
-1. **Predictable Port / Address Allocation:**
-   When the client requests an inbound association, the proxy can report the exact external mapped endpoint, eliminating guesswork.
-2. **Hairpinning & Demultiplexing:**
-   The proxy handles multiple incoming flows toward the same allocated endpoint and demultiplexes them to the client based on peer endpoint identity.
-3. **Direct Peer Punching:**
-   Because the client is in full control of `send_to(target)` and is explicitly told its public mapping, standard hole-punching routines (STUN/ICE primitives) run cleanly through the proxy without needing TUN kernel drivers on the host.
+The client sends `Hello` (opcode `1`) with version in the header and
+`u32 max_frame_size`.
 
----
+The server replies with `Welcome` (opcode `2`) with the selected version in
+the header, then:
 
-## 5. Extensibility & Future Wire Format
+```text
+u32 max_frame_size
+u8 tcp_connect
+u8 udp_associate
+u8 udp_bind
+u32 max_datagram_size
+string server_name
+u16 endpoint_kind_count
+u8[endpoint_kind_count] endpoint_kinds
+```
 
-- **Binary Wire Encoding:** Framing can be implemented over shared memory, UNIX datagram sockets, or lightweight binary packet envelopes over UDP/TCP.
-- **Bare IP & Layer 3:** When bare IP endpoints are selected, the payload is treated as a complete IP packet (`ip_hdr + l4_hdr + payload`), allowing socks6 to act as an unprivileged, user-space virtual network interface.
-- **Cryptographic Routing:** Endpoints can directly reference cryptographic identifiers (such as Lokinet ed25519 public keys) without forcing the client application to bundle custom overlay network clients into its own process space.
+Endpoint-kind tags are: socket `1`, IP `2`, domain `3`, service `4`.
+Capabilities are descriptive; a request using an unsupported operation or
+endpoint receives an `Error`.
 
+## Operations
+
+After `Welcome`, the client sends exactly one operation request.
+
+### TCP connect
+
+`OpenTcp` (opcode `3`) carries one endpoint. On success the server sends
+`TcpReady` (opcode `4`) containing an optional source endpoint. From then on,
+the connection carries raw TCP stream bytes until either side closes. If
+connection setup fails, the server sends `Error` instead.
+
+### UDP association
+
+`OpenUdp` (opcode `5`) contains an optional requested local endpoint. The
+server responds with `UdpReady` (opcode `6`) and an optional bound endpoint.
+An absent bound endpoint means the backend does not expose a local address.
+
+Each `Datagram` (opcode `7`) contains:
+
+```text
+Endpoint endpoint
+u32 payload_length
+byte[payload_length] payload
+```
+
+Client-to-server `endpoint` is the destination. Server-to-client `endpoint`
+is the source. The client may send to multiple destinations through one
+association. A backend may reject that behavior if it only supports a
+destination-specific association. `Close` (opcode `12`) or EOF ends the
+association.
+
+### Status and keepalive
+
+`StatusRequest` (opcode `8`) receives `Status` (opcode `9`), containing a
+connected flag and optional detail string. `Ping` (opcode `10`) receives
+`Pong` (opcode `11`).
+
+### Errors
+
+`Error` (opcode `13`) contains an error-code byte and a string message. Codes
+are invalid request `1`, unsupported `2`, unavailable `3`, limit exceeded
+`4`, internal `5`, and version mismatch `6`. The server closes the operation
+after an error unless the error occurred during the initial handshake.
+
+## Endpoint encoding
+
+Each endpoint starts with a one-byte tag:
+
+| Tag | Endpoint | Fields |
+|---|---|---|
+| `1` | IPv4 socket | 4 address bytes, `u16` port |
+| `2` | IPv6 socket | 16 address bytes, `u16` port, `u32` flow info, `u32` scope ID |
+| `3` | IPv4 address | 4 address bytes |
+| `4` | IPv6 address | 16 address bytes |
+| `5` | Domain socket | string host, `u16` port |
+| `6` | Service endpoint | string namespace, `u32`-length opaque address, optional `u16` port |
+
+Service endpoints let independent backends represent namespaced identifiers
+without adding backend-specific variants to the core crate. For example, an
+overlay backend may use a `Service` endpoint or a domain in its own namespace.
+The namespace and address are opaque to the protocol.
+
+## Security and deployment
+
+The protocol itself does not authenticate peers. Local deployments must use
+transport-level access control: filesystem permissions and peer credentials
+for Unix sockets, or an authenticated secure transport for remote listeners.
+Do not expose a TCP listener to an untrusted network without adding an
+authentication and encryption profile.
+
+The reference crate bounds frame and datagram sizes and uses bounded socket
+resources per operation. Deployments should additionally set connection and
+per-peer resource limits appropriate to their backend.
