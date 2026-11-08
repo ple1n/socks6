@@ -5,8 +5,7 @@ streams and UDP associations from a proxy service. The Rust crate is the
 reference implementation; this document defines the wire format independently
 of that implementation.
 
-SOCKS6 is not tied to nsproxy, Lokinet, a particular operating system, or one
-transport. A server may expose the protocol over any reliable byte stream. The
+SOCKS6 is not tied to nsproxy, a particular operating system, or one transport. A server may expose the protocol over any reliable byte stream. The
 reference crate supports TCP and Unix-domain streams.
 
 ## Design contract

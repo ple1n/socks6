@@ -2,8 +2,7 @@
 
 SOCKS6 is an independent Rust crate and experimental wire protocol for
 requesting TCP streams and UDP associations from a proxy backend. It does not
-depend on nsproxy, Lokinet, Linux namespaces, or a particular network
-transport.
+depend on nsproxy, Linux namespaces, or a particular network transport.
 
 The crate provides:
 
@@ -15,9 +14,9 @@ capabilities, and service status.
 - TCP and Unix-domain server listeners.
 - A direct-socket backend for examples and protocol tests.
 
-Lokinet integration belongs in a separate adapter that implements `Backend`.
-That keeps the protocol reusable and lets each backend advertise only the
-endpoint and operation types it actually supports.
+A backend adapter implements `Backend`, keeping the protocol reusable and
+letting each backend advertise only the endpoint and operation types it
+actually supports.
 
 ## Example
 
@@ -45,7 +44,7 @@ cargo run --bin socks6_client
 ```
 
 The server defaults to `127.0.0.1:1086`. This reference backend opens ordinary
-system TCP and UDP sockets; it is not a Lokinet daemon.
+system TCP and UDP sockets.
 
 On Unix, the same client API can use a local IPC socket instead:
 
