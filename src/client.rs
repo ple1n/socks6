@@ -268,7 +268,7 @@ impl UdpAssociation {
             });
         }
         Frame::Datagram { endpoint, payload }
-            .write_to(&mut *self.writer.lock().await)
+            .write_to_with_limit(&mut *self.writer.lock().await, self.max_frame_size)
             .await
     }
 
@@ -285,10 +285,11 @@ impl UdpAssociation {
     }
 
     pub async fn close(&self) -> Result<()> {
+        let mut writer = self.writer.lock().await;
         Frame::Close
-            .write_to(&mut *self.writer.lock().await)
+            .write_to_with_limit(&mut *writer, self.max_frame_size)
             .await?;
-        self.writer.lock().await.shutdown().await?;
+        writer.shutdown().await?;
         Ok(())
     }
 }

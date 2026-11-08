@@ -6,6 +6,7 @@ use std::io;
 use std::sync::Arc;
 use tokio::io::{copy_bidirectional, split};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::warn;
 
 #[cfg(unix)]
@@ -40,6 +41,7 @@ impl Listener for UnixListener {
 pub struct Server {
     backend: Arc<dyn Backend>,
     max_frame_size: usize,
+    connection_slots: Arc<Semaphore>,
 }
 
 impl Server {
@@ -50,6 +52,7 @@ impl Server {
         Self {
             backend: Arc::new(backend),
             max_frame_size: MAX_FRAME_SIZE,
+            connection_slots: Arc::new(Semaphore::new(1024)),
         }
     }
 
@@ -57,6 +60,7 @@ impl Server {
         Self {
             backend,
             max_frame_size: MAX_FRAME_SIZE,
+            connection_slots: Arc::new(Semaphore::new(1024)),
         }
     }
 
@@ -70,14 +74,33 @@ impl Server {
         Ok(self)
     }
 
+    pub fn with_max_connections(mut self, max_connections: usize) -> Result<Self> {
+        if max_connections == 0 {
+            return Err(Error::Protocol(
+                "maximum connection count must be nonzero".to_owned(),
+            ));
+        }
+        self.connection_slots = Arc::new(Semaphore::new(max_connections));
+        Ok(self)
+    }
+
     pub async fn run<L>(self: Arc<Self>, mut listener: L) -> Result<()>
     where
         L: Listener,
     {
         loop {
             let stream = listener.accept().await?;
+            let permit = match Arc::clone(&self.connection_slots).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    warn!("SOCKS6 connection limit reached; rejecting client");
+                    drop(stream);
+                    continue;
+                }
+            };
             let server = Arc::clone(&self);
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(error) = server.serve_connection(stream).await {
                     warn!(%error, "SOCKS6 client connection ended with an error");
                 }
@@ -131,7 +154,7 @@ impl Server {
             max_frame_size: max_frame_size as u32,
             capabilities: self.backend.capabilities(),
         }
-        .write_to(&mut stream)
+        .write_to_with_limit(&mut stream, max_frame_size)
         .await?;
 
         match Frame::read_from_with_limit(&mut stream, max_frame_size).await? {
@@ -139,12 +162,12 @@ impl Server {
                 let mut upstream = match self.backend.connect_tcp(target).await {
                     Ok(stream) => stream,
                     Err(error) => {
-                        write_backend_error(&mut stream, error).await?;
+                        write_backend_error(&mut stream, error, max_frame_size).await?;
                         return Ok(());
                     }
                 };
                 Frame::TcpReady { source: None }
-                    .write_to(&mut stream)
+                    .write_to_with_limit(&mut stream, max_frame_size)
                     .await?;
                 copy_bidirectional(&mut stream, &mut upstream).await?;
             }
@@ -152,20 +175,26 @@ impl Server {
                 let association = match self.backend.open_udp(bind).await {
                     Ok(association) => association,
                     Err(error) => {
-                        write_backend_error(&mut stream, error).await?;
+                        write_backend_error(&mut stream, error, max_frame_size).await?;
                         return Ok(());
                     }
                 };
                 let bound = association.bound_endpoint();
-                Frame::UdpReady { bound }.write_to(&mut stream).await?;
+                Frame::UdpReady { bound }
+                    .write_to_with_limit(&mut stream, max_frame_size)
+                    .await?;
                 self.serve_udp(stream, association, max_frame_size).await?;
             }
             Frame::StatusRequest => {
                 Frame::Status(self.backend.status())
-                    .write_to(&mut stream)
+                    .write_to_with_limit(&mut stream, max_frame_size)
                     .await?;
             }
-            Frame::Ping => Frame::Pong.write_to(&mut stream).await?,
+            Frame::Ping => {
+                Frame::Pong
+                    .write_to_with_limit(&mut stream, max_frame_size)
+                    .await?
+            }
             Frame::Close => {}
             _ => {
                 Frame::Error {
@@ -195,12 +224,16 @@ impl Server {
                     match incoming? {
                         Frame::Datagram { endpoint, payload } => {
                             if let Err(error) = association.send_to(endpoint, payload).await {
-                                write_backend_error(&mut writer, error).await?;
+                                write_backend_error(&mut writer, error, max_frame_size).await?;
                                 return Ok(());
                             }
                         }
                         Frame::Close => return Ok(()),
-                        Frame::Ping => Frame::Pong.write_to(&mut writer).await?,
+                        Frame::Ping => {
+                            Frame::Pong
+                                .write_to_with_limit(&mut writer, max_frame_size)
+                                .await?
+                        }
                         _ => {
                             Frame::Error {
                                 code: ErrorCode::InvalidRequest,
@@ -216,7 +249,7 @@ impl Server {
                     let datagram = match outgoing {
                         Ok(datagram) => datagram,
                         Err(error) => {
-                            write_backend_error(&mut writer, error).await?;
+                            write_backend_error(&mut writer, error, max_frame_size).await?;
                             return Ok(());
                         }
                     };
@@ -224,7 +257,7 @@ impl Server {
                         endpoint: datagram.endpoint,
                         payload: datagram.payload,
                     }
-                    .write_to(&mut writer)
+                    .write_to_with_limit(&mut writer, max_frame_size)
                     .await?;
                 }
             }
@@ -232,7 +265,11 @@ impl Server {
     }
 }
 
-async fn write_backend_error<W>(writer: &mut W, error: BackendError) -> Result<()>
+async fn write_backend_error<W>(
+    writer: &mut W,
+    error: BackendError,
+    max_frame_size: usize,
+) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -240,6 +277,6 @@ where
         code: error.code(),
         message: error.to_string(),
     }
-    .write_to(writer)
+    .write_to_with_limit(writer, max_frame_size)
     .await
 }
