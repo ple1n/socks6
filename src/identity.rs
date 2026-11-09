@@ -52,6 +52,11 @@ impl fmt::Display for IdentityAddress {
 ///
 /// Streams mean reliable byte streams and datagrams mean unreliable messages;
 /// these semantics do not constrain the underlying network transport.
+///
+/// Design direction: identity negotiation could advertise channel protocol
+/// IDs here (well-known IDs where useful, plus application-defined IDs) in
+/// place of fixed booleans. The selected ID describes the channel contract;
+/// the channel remains an abstraction independent of its carrier.
 pub struct IdentityCapabilities {
     pub send_streams: bool,
     pub send_datagrams: bool,
