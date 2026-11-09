@@ -91,7 +91,11 @@ impl Client {
     }
 
     pub async fn query_capabilities(&self) -> Result<Capabilities> {
-        let (_, capabilities, _) = self.open_session().await?;
+        let (mut stream, capabilities, max_frame_size) = self.open_session().await?;
+        Frame::Close
+            .write_to_with_limit(&mut stream, max_frame_size)
+            .await?;
+        stream.shutdown().await?;
         Ok(capabilities)
     }
 
@@ -291,5 +295,45 @@ impl UdpAssociation {
             .await?;
         writer.shutdown().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::MAX_FRAME_SIZE;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn querying_capabilities_closes_the_protocol_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let hello = Frame::read_from(&mut stream).await.unwrap();
+            let Frame::Hello { max_frame_size, .. } = hello else {
+                panic!("expected Hello");
+            };
+            let capabilities = Capabilities {
+                server_name: "test-server".to_owned(),
+                ..Capabilities::default()
+            };
+            Frame::Welcome {
+                version: PROTOCOL_VERSION,
+                max_frame_size: max_frame_size.min(MAX_FRAME_SIZE as u32),
+                capabilities,
+            }
+            .write_to(&mut stream)
+            .await
+            .unwrap();
+            assert_eq!(Frame::read_from(&mut stream).await.unwrap(), Frame::Close);
+        });
+
+        let client = Client::from_connector(TcpConnector::new(address));
+        assert_eq!(
+            client.query_capabilities().await.unwrap().server_name,
+            "test-server"
+        );
+        server.await.unwrap();
     }
 }
