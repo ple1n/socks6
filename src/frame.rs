@@ -1,19 +1,20 @@
-use crate::endpoint::{Endpoint, EndpointKind};
+use crate::endpoint::Endpoint;
 use crate::error::{Error, Result};
+use crate::identity::{
+    IdentityAddress, IdentityCapabilities, IdentityLease, IdentityOffer, IdentitySelection,
+    IdentityUse, MAX_IDENTITY_ID_LENGTH,
+};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAGIC: [u8; 2] = *b"S6";
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_DATAGRAM_SIZE: usize = 65_507;
+pub const MAX_IDENTITY_OFFERS: usize = 256;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Capabilities {
-    pub tcp_connect: bool,
-    pub udp_associate: bool,
-    pub udp_bind: bool,
-    pub endpoint_kinds: Vec<EndpointKind>,
     pub max_datagram_size: u32,
     pub server_name: String,
 }
@@ -44,17 +45,42 @@ pub enum Frame {
         version: u16,
         max_frame_size: u32,
         capabilities: Capabilities,
+        identities: Vec<IdentityOffer>,
     },
-    OpenTcp {
+    IdentityOffersRequest,
+    IdentityOffers {
+        identities: Vec<IdentityOffer>,
+    },
+    LeaseIdentity {
+        identity_id: Option<String>,
+    },
+    IdentityLeased {
+        lease: IdentityLease,
+    },
+    ReleaseIdentity {
+        lease_id: String,
+    },
+    IdentityReleased,
+    OpenStream {
+        identity: IdentitySelection,
         target: Endpoint,
     },
-    TcpReady {
+    AcceptStream {
+        identity: IdentitySelection,
+    },
+    StreamReady {
+        identity: IdentityUse,
         source: Option<Endpoint>,
     },
-    OpenUdp {
-        bind: Option<Endpoint>,
+    StreamAccepted {
+        identity: IdentityUse,
+        peer: Endpoint,
     },
-    UdpReady {
+    OpenDatagrams {
+        identity: IdentitySelection,
+    },
+    DatagramsReady {
+        identity: IdentityUse,
         bound: Option<Endpoint>,
     },
     Datagram {
@@ -90,63 +116,107 @@ impl Frame {
                 version,
                 max_frame_size,
                 capabilities,
+                identities,
             } => {
                 encoder.u16(*version);
                 encoder.u8(2);
                 encoder.u32(*max_frame_size);
                 encoder.capabilities(capabilities)?;
+                encoder.identities(identities)?;
             }
-            Self::OpenTcp { target } => {
+            Self::IdentityOffersRequest => {
                 encoder.u16(PROTOCOL_VERSION);
                 encoder.u8(3);
-                encoder.endpoint(target)?;
             }
-            Self::TcpReady { source } => {
+            Self::IdentityOffers { identities } => {
                 encoder.u16(PROTOCOL_VERSION);
                 encoder.u8(4);
-                encoder.optional_endpoint(source.as_ref())?;
+                encoder.identities(identities)?;
             }
-            Self::OpenUdp { bind } => {
+            Self::LeaseIdentity { identity_id } => {
                 encoder.u16(PROTOCOL_VERSION);
                 encoder.u8(5);
-                encoder.optional_endpoint(bind.as_ref())?;
+                encoder.optional_string(identity_id.as_deref())?;
             }
-            Self::UdpReady { bound } => {
+            Self::IdentityLeased { lease } => {
                 encoder.u16(PROTOCOL_VERSION);
                 encoder.u8(6);
+                encoder.identity_lease(lease)?;
+            }
+            Self::ReleaseIdentity { lease_id } => {
+                encoder.u16(PROTOCOL_VERSION);
+                encoder.u8(7);
+                encoder.string(lease_id)?;
+            }
+            Self::IdentityReleased => {
+                encoder.u16(PROTOCOL_VERSION);
+                encoder.u8(8);
+            }
+            Self::OpenStream { identity, target } => {
+                encoder.u16(PROTOCOL_VERSION);
+                encoder.u8(9);
+                encoder.identity_selection(identity)?;
+                encoder.endpoint(target)?;
+            }
+            Self::StreamReady { identity, source } => {
+                encoder.u16(PROTOCOL_VERSION);
+                encoder.u8(10);
+                encoder.identity_use(identity)?;
+                encoder.optional_endpoint(source.as_ref())?;
+            }
+            Self::AcceptStream { identity } => {
+                encoder.u16(PROTOCOL_VERSION);
+                encoder.u8(20);
+                encoder.identity_selection(identity)?;
+            }
+            Self::StreamAccepted { identity, peer } => {
+                encoder.u16(PROTOCOL_VERSION);
+                encoder.u8(21);
+                encoder.identity_use(identity)?;
+                encoder.endpoint(peer)?;
+            }
+            Self::OpenDatagrams { identity } => {
+                encoder.u16(PROTOCOL_VERSION);
+                encoder.u8(11);
+                encoder.identity_selection(identity)?;
+            }
+            Self::DatagramsReady { identity, bound } => {
+                encoder.u16(PROTOCOL_VERSION);
+                encoder.u8(12);
+                encoder.identity_use(identity)?;
                 encoder.optional_endpoint(bound.as_ref())?;
             }
             Self::Datagram { endpoint, payload } => {
                 encoder.u16(PROTOCOL_VERSION);
-                encoder.u8(7);
+                encoder.u8(13);
                 encoder.endpoint(endpoint)?;
                 encoder.bytes(payload)?;
             }
             Self::StatusRequest => {
                 encoder.u16(PROTOCOL_VERSION);
-                encoder.u8(8);
+                encoder.u8(14);
             }
             Self::Status(status) => {
                 encoder.u16(PROTOCOL_VERSION);
-                encoder.u8(9);
+                encoder.u8(15);
                 encoder.u8(u8::from(status.connected));
                 encoder.optional_string(status.detail.as_deref())?;
             }
             Self::Ping => {
                 encoder.u16(PROTOCOL_VERSION);
-                encoder.u8(10);
+                encoder.u8(16);
             }
             Self::Pong => {
                 encoder.u16(PROTOCOL_VERSION);
-                encoder.u8(11);
+                encoder.u8(17);
             }
             Self::Close => {
                 encoder.u16(PROTOCOL_VERSION);
-                encoder.u8(12);
+                encoder.u8(18);
             }
             Self::Error { code, message } => {
                 encoder.u16(PROTOCOL_VERSION);
-                encoder.u8(13);
+                encoder.u8(19);
                 encoder.u8(error_code_to_wire(*code));
                 encoder.string(message)?;
             }
@@ -182,62 +252,111 @@ impl Frame {
                 version,
                 max_frame_size: decoder.u32()?,
                 capabilities: decoder.capabilities()?,
+                identities: decoder.identities()?,
             },
             3 => {
                 ensure_version(version)?;
-                Self::OpenTcp {
-                    target: decoder.endpoint()?,
-                }
+                Self::IdentityOffersRequest
             }
             4 => {
                 ensure_version(version)?;
-                Self::TcpReady {
-                    source: decoder.optional_endpoint()?,
+                Self::IdentityOffers {
+                    identities: decoder.identities()?,
                 }
             }
             5 => {
                 ensure_version(version)?;
-                Self::OpenUdp {
-                    bind: decoder.optional_endpoint()?,
+                Self::LeaseIdentity {
+                    identity_id: decoder.optional_string()?,
                 }
             }
             6 => {
                 ensure_version(version)?;
-                Self::UdpReady {
-                    bound: decoder.optional_endpoint()?,
+                Self::IdentityLeased {
+                    lease: decoder.identity_lease()?,
                 }
             }
             7 => {
+                ensure_version(version)?;
+                Self::ReleaseIdentity {
+                    lease_id: decoder.string()?,
+                }
+            }
+            8 => {
+                ensure_version(version)?;
+                Self::IdentityReleased
+            }
+            9 => {
+                ensure_version(version)?;
+                Self::OpenStream {
+                    identity: decoder.identity_selection()?,
+                    target: decoder.endpoint()?,
+                }
+            }
+            10 => {
+                ensure_version(version)?;
+                Self::StreamReady {
+                    identity: decoder.identity_use()?,
+                    source: decoder.optional_endpoint()?,
+                }
+            }
+            20 => {
+                ensure_version(version)?;
+                Self::AcceptStream {
+                    identity: decoder.identity_selection()?,
+                }
+            }
+            21 => {
+                ensure_version(version)?;
+                Self::StreamAccepted {
+                    identity: decoder.identity_use()?,
+                    peer: decoder.endpoint()?,
+                }
+            }
+            11 => {
+                ensure_version(version)?;
+                Self::OpenDatagrams {
+                    identity: decoder.identity_selection()?,
+                }
+            }
+            12 => {
+                ensure_version(version)?;
+                Self::DatagramsReady {
+                    identity: decoder.identity_use()?,
+                    bound: decoder.optional_endpoint()?,
+                }
+            }
+            13 => {
                 ensure_version(version)?;
                 Self::Datagram {
                     endpoint: decoder.endpoint()?,
                     payload: decoder.bytes()?,
                 }
             }
-            8 => {
+            14 => {
                 ensure_version(version)?;
                 Self::StatusRequest
             }
-            9 => {
+            15 => {
                 ensure_version(version)?;
                 Self::Status(ServiceStatus {
                     connected: decoder.boolean()?,
                     detail: decoder.optional_string()?,
                 })
             }
-            10 => {
+            16 => {
                 ensure_version(version)?;
                 Self::Ping
             }
-            11 => {
+            17 => {
                 ensure_version(version)?;
                 Self::Pong
             }
-            12 => {
+            18 => {
                 ensure_version(version)?;
                 Self::Close
             }
-            13 => {
+            19 => {
                 ensure_version(version)?;
                 Self::Error {
                     code: error_code_from_wire(decoder.u8()?)?,
@@ -319,6 +438,7 @@ impl Frame {
                 version,
                 max_frame_size,
                 capabilities,
+                identities,
             } => {
                 if *version == 0 || *max_frame_size < 128 {
                     return Err(Error::Protocol("invalid welcome parameters".to_owned()));
@@ -328,12 +448,32 @@ impl Frame {
                         "server advertised an unsupported datagram size".to_owned(),
                     ));
                 }
-                Ok(())
+                validate_identities(identities)
             }
-            Self::OpenTcp { target } => check_endpoint(target),
-            Self::TcpReady { source } => source.as_ref().map_or(Ok(()), check_endpoint),
-            Self::OpenUdp { bind } => bind.as_ref().map_or(Ok(()), check_endpoint),
-            Self::UdpReady { bound } => bound.as_ref().map_or(Ok(()), check_endpoint),
+            Self::IdentityOffers { identities } => validate_identities(identities),
+            Self::LeaseIdentity {
+                identity_id: Some(id),
+            }
+            | Self::ReleaseIdentity { lease_id: id } => check_identity_id(id),
+            Self::IdentityLeased { lease } => lease.validate(),
+            Self::OpenStream { identity, target } => {
+                identity.validate()?;
+                check_endpoint(target)
+            }
+            Self::StreamReady { identity, source } => {
+                identity.validate()?;
+                source.as_ref().map_or(Ok(()), check_endpoint)
+            }
+            Self::AcceptStream { identity } => identity.validate(),
+            Self::StreamAccepted { identity, peer } => {
+                identity.validate()?;
+                check_endpoint(peer)
+            }
+            Self::OpenDatagrams { identity } => identity.validate(),
+            Self::DatagramsReady { identity, bound } => {
+                identity.validate()?;
+                bound.as_ref().map_or(Ok(()), check_endpoint)
+            }
             Self::Datagram { endpoint, payload } => {
                 check_endpoint(endpoint)?;
                 if payload.len() > MAX_DATAGRAM_SIZE {
@@ -470,16 +610,100 @@ impl Encoder {
     }
 
     fn capabilities(&mut self, capabilities: &Capabilities) -> Result<()> {
-        self.u8(u8::from(capabilities.tcp_connect));
-        self.u8(u8::from(capabilities.udp_associate));
-        self.u8(u8::from(capabilities.udp_bind));
         self.u32(capabilities.max_datagram_size);
         self.string(&capabilities.server_name)?;
-        let count = u16::try_from(capabilities.endpoint_kinds.len())
-            .map_err(|_| Error::Protocol("too many endpoint kinds".to_owned()))?;
+        Ok(())
+    }
+
+    fn identity_capabilities(&mut self, capabilities: &IdentityCapabilities) {
+        self.u8(u8::from(capabilities.send_streams));
+        self.u8(u8::from(capabilities.send_datagrams));
+        self.u8(u8::from(capabilities.receive_streams));
+        self.u8(u8::from(capabilities.receive_datagrams));
+    }
+
+    fn identity_offer(&mut self, identity: &IdentityOffer) -> Result<()> {
+        self.string(&identity.id)?;
+        self.optional_identity_address(identity.address.as_ref())?;
+        self.identity_capabilities(&identity.capabilities);
+        Ok(())
+    }
+
+    fn optional_identity_address(&mut self, address: Option<&IdentityAddress>) -> Result<()> {
+        match address {
+            Some(address) => {
+                self.u8(1);
+                match address {
+                    IdentityAddress::Socket(SocketAddr::V4(address)) => {
+                        self.u8(1);
+                        self.raw(&address.ip().octets());
+                        self.u16(address.port());
+                    }
+                    IdentityAddress::Socket(SocketAddr::V6(address)) => {
+                        self.u8(2);
+                        self.raw(&address.ip().octets());
+                        self.u16(address.port());
+                        self.u32(address.flowinfo());
+                        self.u32(address.scope_id());
+                    }
+                    IdentityAddress::Ip(IpAddr::V4(address)) => {
+                        self.u8(3);
+                        self.raw(&address.octets());
+                    }
+                    IdentityAddress::Ip(IpAddr::V6(address)) => {
+                        self.u8(4);
+                        self.raw(&address.octets());
+                    }
+                    IdentityAddress::Domain(host) => {
+                        self.u8(5);
+                        self.string(host)?;
+                    }
+                    IdentityAddress::Service { namespace, address } => {
+                        self.u8(6);
+                        self.string(namespace)?;
+                        self.bytes(address)?;
+                    }
+                }
+                Ok(())
+            }
+            None => {
+                self.u8(0);
+                Ok(())
+            }
+        }
+    }
+
+    fn identities(&mut self, identities: &[IdentityOffer]) -> Result<()> {
+        let count = u16::try_from(identities.len())
+            .map_err(|_| Error::Protocol("too many identity offers".to_owned()))?;
         self.u16(count);
-        for kind in &capabilities.endpoint_kinds {
-            self.u8(endpoint_kind_to_wire(*kind));
+        for identity in identities {
+            self.identity_offer(identity)?;
+        }
+        Ok(())
+    }
+
+    fn identity_lease(&mut self, lease: &IdentityLease) -> Result<()> {
+        self.string(&lease.id)?;
+        self.identity_offer(&lease.identity)
+    }
+
+    fn identity_use(&mut self, identity: &IdentityUse) -> Result<()> {
+        self.identity_offer(&identity.identity)?;
+        self.optional_string(identity.lease_id.as_deref())
+    }
+
+    fn identity_selection(&mut self, identity: &IdentitySelection) -> Result<()> {
+        match identity {
+            IdentitySelection::Any => self.u8(0),
+            IdentitySelection::Offer(id) => {
+                self.u8(1);
+                self.string(id)?;
+            }
+            IdentitySelection::Lease(id) => {
+                self.u8(2);
+                self.string(id)?;
+            }
         }
         Ok(())
     }
@@ -605,24 +829,105 @@ impl<'a> Decoder<'a> {
     }
 
     fn capabilities(&mut self) -> Result<Capabilities> {
-        let tcp_connect = self.boolean()?;
-        let udp_associate = self.boolean()?;
-        let udp_bind = self.boolean()?;
         let max_datagram_size = self.u32()?;
         let server_name = self.string()?;
-        let count = usize::from(self.u16()?);
-        let mut endpoint_kinds = Vec::with_capacity(count);
-        for _ in 0..count {
-            endpoint_kinds.push(endpoint_kind_from_wire(self.u8()?)?);
-        }
         Ok(Capabilities {
-            tcp_connect,
-            udp_associate,
-            udp_bind,
-            endpoint_kinds,
             max_datagram_size,
             server_name,
         })
+    }
+
+    fn identity_capabilities(&mut self) -> Result<IdentityCapabilities> {
+        Ok(IdentityCapabilities {
+            send_streams: self.boolean()?,
+            send_datagrams: self.boolean()?,
+            receive_streams: self.boolean()?,
+            receive_datagrams: self.boolean()?,
+        })
+    }
+
+    fn identity_offer(&mut self) -> Result<IdentityOffer> {
+        Ok(IdentityOffer {
+            id: self.string()?,
+            address: self.optional_identity_address()?,
+            capabilities: self.identity_capabilities()?,
+        })
+    }
+
+    fn optional_identity_address(&mut self) -> Result<Option<IdentityAddress>> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => {
+                let address = match self.u8()? {
+                    1 => {
+                        let ip = Ipv4Addr::from(<[u8; 4]>::try_from(self.take(4)?).unwrap());
+                        IdentityAddress::Socket(SocketAddr::new(IpAddr::V4(ip), self.u16()?))
+                    }
+                    2 => {
+                        let ip = Ipv6Addr::from(<[u8; 16]>::try_from(self.take(16)?).unwrap());
+                        let port = self.u16()?;
+                        let flowinfo = self.u32()?;
+                        let scope_id = self.u32()?;
+                        IdentityAddress::Socket(SocketAddr::V6(SocketAddrV6::new(
+                            ip, port, flowinfo, scope_id,
+                        )))
+                    }
+                    3 => IdentityAddress::Ip(IpAddr::V4(Ipv4Addr::from(
+                        <[u8; 4]>::try_from(self.take(4)?).unwrap(),
+                    ))),
+                    4 => IdentityAddress::Ip(IpAddr::V6(Ipv6Addr::from(
+                        <[u8; 16]>::try_from(self.take(16)?).unwrap(),
+                    ))),
+                    5 => IdentityAddress::Domain(self.string()?),
+                    6 => IdentityAddress::Service {
+                        namespace: self.string()?,
+                        address: self.bytes()?,
+                    },
+                    tag => {
+                        return Err(Error::Protocol(format!(
+                            "unknown identity address tag {tag}"
+                        )));
+                    }
+                };
+                Ok(Some(address))
+            }
+            value => Err(Error::Protocol(format!(
+                "invalid optional identity address flag {value}"
+            ))),
+        }
+    }
+
+    fn identities(&mut self) -> Result<Vec<IdentityOffer>> {
+        let count = usize::from(self.u16()?);
+        if count > MAX_IDENTITY_OFFERS {
+            return Err(Error::Protocol("too many identity offers".to_owned()));
+        }
+        (0..count).map(|_| self.identity_offer()).collect()
+    }
+
+    fn identity_lease(&mut self) -> Result<IdentityLease> {
+        Ok(IdentityLease {
+            id: self.string()?,
+            identity: self.identity_offer()?,
+        })
+    }
+
+    fn identity_use(&mut self) -> Result<IdentityUse> {
+        Ok(IdentityUse {
+            identity: self.identity_offer()?,
+            lease_id: self.optional_string()?,
+        })
+    }
+
+    fn identity_selection(&mut self) -> Result<IdentitySelection> {
+        match self.u8()? {
+            0 => Ok(IdentitySelection::Any),
+            1 => Ok(IdentitySelection::Offer(self.string()?)),
+            2 => Ok(IdentitySelection::Lease(self.string()?)),
+            tag => Err(Error::Protocol(format!(
+                "unknown identity selection tag {tag}"
+            ))),
+        }
     }
 
     fn finish(self) -> Result<()> {
@@ -634,6 +939,25 @@ impl<'a> Decoder<'a> {
     }
 }
 
+fn validate_identities(identities: &[IdentityOffer]) -> Result<()> {
+    if identities.len() > MAX_IDENTITY_OFFERS {
+        return Err(Error::Protocol("too many identity offers".to_owned()));
+    }
+    for identity in identities {
+        identity.validate()?;
+    }
+    Ok(())
+}
+
+fn check_identity_id(id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > MAX_IDENTITY_ID_LENGTH {
+        return Err(Error::Protocol(format!(
+            "identity id must contain 1 to {MAX_IDENTITY_ID_LENGTH} bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn ensure_version(version: u16) -> Result<()> {
     if version == PROTOCOL_VERSION {
         Ok(())
@@ -641,27 +965,6 @@ fn ensure_version(version: u16) -> Result<()> {
         Err(Error::Protocol(format!(
             "unsupported protocol version {version}"
         )))
-    }
-}
-
-fn endpoint_kind_to_wire(kind: EndpointKind) -> u8 {
-    match kind {
-        EndpointKind::Socket => 1,
-        EndpointKind::Ip => 2,
-        EndpointKind::Domain => 3,
-        EndpointKind::Service => 4,
-    }
-}
-
-fn endpoint_kind_from_wire(value: u8) -> Result<EndpointKind> {
-    match value {
-        1 => Ok(EndpointKind::Socket),
-        2 => Ok(EndpointKind::Ip),
-        3 => Ok(EndpointKind::Domain),
-        4 => Ok(EndpointKind::Service),
-        _ => Err(Error::Protocol(format!(
-            "unknown endpoint capability {value}"
-        ))),
     }
 }
 

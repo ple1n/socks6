@@ -1,33 +1,71 @@
 # SOCKS6 protocol
 
-Version 1 is an experimental, backend-neutral protocol for requesting TCP
-streams and UDP associations from a proxy service. The Rust crate is the
-reference implementation; this document defines the wire format independently
-of that implementation.
+Version 2 is an experimental, backend-neutral protocol for offering proxy
+identities and leasing their capabilities. A client can use a lease for
+outbound requests and for any inbound handling the offered identity supports.
+Version 2 is a breaking change from version 1.
 
-SOCKS6 is not tied to nsproxy, a particular operating system, or one transport. A server may expose the protocol over any reliable byte stream. The
+SOCKS6 is not tied to nsproxy, a particular operating system, or one network
+backend. A server may expose the protocol over any reliable byte stream. The
 reference crate supports TCP and Unix-domain streams.
 
-## Design contract
+## Semantics
 
-- **One connection, one operation.** Each control connection opens one TCP
-  stream, one UDP association, or one short-lived status/ping request. Flow
-  identity is the transport connection, so version 1 needs no request IDs or
-  global flow table.
-- **TCP stays a stream.** After a successful TCP-open response, the same
-  transport connection carries unframed, bidirectional bytes. Closing either
-  side's write half propagates as a TCP half-close.
-- **UDP stays datagrams.** A UDP association uses SOCKS6 frames for each
-  datagram, preserving message boundaries and the peer endpoint.
-- **Backends own network semantics.** Endpoint resolution, routing, binding,
-  and reachability belong to the backend. Capabilities describe what that
-  backend actually implements.
-- **Disconnect releases resources.** EOF or `Close` tears down the operation
-  and its backend resources.
+The protocol's **stream** and **datagram** operations describe data semantics:
+a stream is a reliable, ordered byte sequence; datagrams are discrete messages
+that may be lost or reordered. They do **not** prescribe the network transport
+used by the backend. A stream may be carried by a non-TCP overlay, and a
+datagram service may be implemented over a reliable carrier.
 
-Version 1 does not define NAT discovery, hole punching, a public mapping
-service, raw IP packet injection, authentication, or unreliable transport.
-Those are separate extensions, not implied by endpoint encoding.
+## Identity negotiation
+
+The server includes an identity-offer set in `Welcome`. A client may refresh
+the set with `IdentityOffersRequest` at any time. Each offer has a stable
+backend-defined ID, an optional address, and independent capabilities for
+sending and receiving streams and datagrams. An absent address means the
+backend can use an identity without exposing its concrete address in the
+offer.
+
+An identity address is distinct from a target endpoint:
+
+| Tag | Identity address | Fields |
+|---|---|---|
+| `1` | IPv4 socket address | 4 address bytes, `u16` port |
+| `2` | IPv6 socket address | 16 address bytes, `u16` port, `u32` flow info, `u32` scope ID |
+| `3` | IPv4 address | 4 address bytes |
+| `4` | IPv6 address | 16 address bytes |
+| `5` | Domain / overlay identity | string |
+| `6` | Service identity | string namespace, `u32`-length opaque address |
+
+An address in an offer is a capability claim, not permission for the client to
+spoof an arbitrary source address. For IP identities, the proxy must be able
+to route or bind that address and account for any NAT or egress translation.
+Inbound capability means the proxy can make incoming traffic reachable and
+deliver it to the client; merely owning an address is not sufficient.
+
+`LeaseIdentity` asks the server to lease a particular offered identity, or
+lets the server choose when the ID is absent. `IdentityLeased` returns a
+server-issued lease ID and the selected offer. A lease can be released with
+`ReleaseIdentity`. Leases are valid across independent request connections
+until released or the server exits.
+
+An operation can select:
+
+- an existing lease ID;
+- an offered identity ID for this request; or
+- `Any`, asking the server to select a suitable identity.
+
+Offer and `Any` selections are scoped to that operation and do not create a
+persistent lease. If selection or resource allocation fails, the server
+returns `Error` rather than silently substituting an identity. Operation
+replies include the selected offer and include a lease ID only when the request
+used an existing lease.
+
+The reference API uses a separate carrier connection for each request. The
+client may keep an identity-negotiation connection open and repeat offer
+queries, lease acquisitions, and releases on it. Stream and datagram
+operations use separate carrier connections and can reuse leases acquired by
+the negotiation connection.
 
 ## Framing
 
@@ -47,58 +85,100 @@ u8 opcode
 opcode-specific fields
 ```
 
-Version 1 uses the field encodings below. Integers are unsigned and
-big-endian. Strings are UTF-8 preceded by a `u16` byte length. Byte strings
-are preceded by a `u32` length. Booleans are one byte (`0` or `1`). Optional
+Version 2 uses the field encodings below. Integers are unsigned and
+big-endian. Strings are UTF-8 preceded by a `u16` byte length. Byte strings are
+preceded by a `u32` length. Booleans are one byte (`0` or `1`). Optional
 values are a one-byte presence flag followed by the value when present.
 Decoders reject truncated frames, unknown tags, invalid UTF-8, and trailing
 bytes.
 
 The maximum body size is 1 MiB. A peer advertises its limit in the handshake;
-the negotiated limit is the smaller value. UDP payloads are limited to 65,507
-bytes and must also fit in the frame limit.
+the negotiated limit is the smaller value. The server offers at most 256
+identities. Datagrams are limited to 65,507 bytes and must also fit in the
+frame limit.
 
-## Handshake and capabilities
+## Handshake and identity set
 
 The client sends `Hello` (opcode `1`) with version in the header and
 `u32 max_frame_size`.
 
-The server replies with `Welcome` (opcode `2`) with the selected version in
-the header, then:
+The server replies with `Welcome` (opcode `2`) with the selected version in the
+header, then:
 
 ```text
 u32 max_frame_size
-u8 tcp_connect
-u8 udp_associate
-u8 udp_bind
 u32 max_datagram_size
 string server_name
-u16 endpoint_kind_count
-u8[endpoint_kind_count] endpoint_kinds
+u16 identity_count
+IdentityOffer[identity_count]
 ```
 
-Endpoint-kind tags are: socket `1`, IP `2`, domain `3`, service `4`.
-Capabilities are descriptive; a request using an unsupported operation or
-endpoint receives an `Error`.
+An `IdentityOffer` is encoded as:
+
+```text
+string identity_id
+optional IdentityAddress
+u8 send_streams
+u8 send_datagrams
+u8 receive_streams
+u8 receive_datagrams
+```
+
+Identity-address tags are defined above. `IdentityOffersRequest` (opcode `3`)
+returns a fresh `IdentityOffers` list (opcode `4`).
+
+## Leases
+
+`LeaseIdentity` (opcode `5`) contains an optional identity ID; absent means
+the server selects from its current offers. `IdentityLeased` (opcode `6`)
+contains:
+
+```text
+string lease_id
+IdentityOffer identity
+```
+
+`ReleaseIdentity` (opcode `7`) contains a lease ID. `IdentityReleased`
+(opcode `8`) confirms release. Releasing an unknown lease is an error.
+
+Identity selection in stream and datagram requests is encoded as a tag:
+
+| Tag | Selection | Fields |
+|---|---|---|
+| `0` | Server-selected identity | none |
+| `1` | Offered identity for this request | string identity ID |
+| `2` | Existing lease | string lease ID |
+
+An `IdentityUse` in an operation response contains an `IdentityOffer` followed
+by an optional lease ID.
 
 ## Operations
 
-After `Welcome`, the client sends exactly one operation request.
+Each operation request uses one carrier connection. The client can open more
+carrier connections and reuse the same lease.
 
-### TCP connect
+### Reliable stream
 
-`OpenTcp` (opcode `3`) carries one endpoint. On success the server sends
-`TcpReady` (opcode `4`) containing an optional source endpoint. From then on,
-the connection carries raw TCP stream bytes until either side closes. If
-connection setup fails, the server sends `Error` instead.
+`OpenStream` (opcode `9`) contains an identity selection and a target endpoint.
+On success the server sends `StreamReady` (opcode `10`) with the identity use
+and an optional source endpoint. From then on, the carrier
+connection carries unframed, bidirectional stream bytes until either side
+closes. If setup fails, the server sends `Error`.
 
-### UDP association
+`AcceptStream` (opcode `20`) contains an identity selection for an identity
+whose offer has `receive_streams` enabled. The server waits for one incoming
+stream and replies with `StreamAccepted` (opcode `21`), containing the effective
+identity use and the incoming peer endpoint. The carrier then relays that stream until
+either side closes. The client can issue another `AcceptStream` request with
+the same lease to wait for another incoming stream.
 
-`OpenUdp` (opcode `5`) contains an optional requested local endpoint. The
-server responds with `UdpReady` (opcode `6`) and an optional bound endpoint.
-An absent bound endpoint means the backend does not expose a local address.
+### Unreliable datagrams
 
-Each `Datagram` (opcode `7`) contains:
+`OpenDatagrams` (opcode `11`) contains an identity selection. The server
+responds with `DatagramsReady` (opcode `12`) containing the identity use and an
+optional reachable endpoint for receiving datagrams.
+
+Each `Datagram` (opcode `13`) contains:
 
 ```text
 Endpoint endpoint
@@ -106,28 +186,26 @@ u32 payload_length
 byte[payload_length] payload
 ```
 
-Client-to-server `endpoint` is the destination. Server-to-client `endpoint`
-is the source. The client may send to multiple destinations through one
-association. A backend may reject that behavior if it only supports a
-destination-specific association. `Close` (opcode `12`) or EOF ends the
-association.
+Client-to-server endpoints are destinations; server-to-client endpoints are
+sources. The client may send to multiple destinations through one datagram
+channel. `Close` (opcode `18`) or EOF ends the channel.
 
 ### Status and keepalive
 
-`StatusRequest` (opcode `8`) receives `Status` (opcode `9`), containing a
-connected flag and optional detail string. `Ping` (opcode `10`) receives
-`Pong` (opcode `11`).
+`StatusRequest` (opcode `14`) receives `Status` (opcode `15`), containing a
+connected flag and optional detail string. `Ping` (opcode `16`) receives
+`Pong` (opcode `17`).
 
 ### Errors
 
-`Error` (opcode `13`) contains an error-code byte and a string message. Codes
-are invalid request `1`, unsupported `2`, unavailable `3`, limit exceeded
-`4`, internal `5`, and version mismatch `6`. The server closes the operation
-after an error unless the error occurred during the initial handshake.
+`Error` (opcode `19`) contains an error-code byte and a string message. Codes
+are invalid request `1`, unsupported `2`, unavailable `3`, limit exceeded `4`,
+internal `5`, and version mismatch `6`. The server closes the request after an
+error unless it occurred during the initial handshake.
 
-## Endpoint encoding
+## Target endpoint encoding
 
-Each endpoint starts with a one-byte tag:
+Each target endpoint starts with a one-byte tag:
 
 | Tag | Endpoint | Fields |
 |---|---|---|
@@ -135,13 +213,11 @@ Each endpoint starts with a one-byte tag:
 | `2` | IPv6 socket | 16 address bytes, `u16` port, `u32` flow info, `u32` scope ID |
 | `3` | IPv4 address | 4 address bytes |
 | `4` | IPv6 address | 16 address bytes |
-| `5` | Domain socket | string host, `u16` port |
+| `5` | Domain endpoint | string host, `u16` port |
 | `6` | Service endpoint | string namespace, `u32`-length opaque address, optional `u16` port |
 
 Service endpoints let independent backends represent namespaced identifiers
-without adding backend-specific variants to the core crate. For example, an
-overlay backend may use a `Service` endpoint or a domain in its own namespace.
-The namespace and address are opaque to the protocol.
+without adding backend-specific variants to the core crate.
 
 ## Security and deployment
 
@@ -151,6 +227,6 @@ for Unix sockets, or an authenticated secure transport for remote listeners.
 Do not expose a TCP listener to an untrusted network without adding an
 authentication and encryption profile.
 
-The reference crate bounds frame and datagram sizes and uses bounded socket
-resources per operation. Deployments should additionally set connection and
-per-peer resource limits appropriate to their backend.
+The reference crate bounds frame, identity-offer, and active-lease counts.
+Deployments should additionally set connection and per-peer resource limits
+appropriate to their backend.

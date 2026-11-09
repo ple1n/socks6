@@ -1,5 +1,6 @@
 use socks6::{
-    Capabilities, Endpoint, EndpointKind, ErrorCode, Frame, ServiceStatus, MAX_DATAGRAM_SIZE,
+    Capabilities, Endpoint, ErrorCode, Frame, IdentityAddress, IdentityCapabilities, IdentityLease,
+    IdentityOffer, IdentitySelection, IdentityUse, ServiceStatus, MAX_DATAGRAM_SIZE,
     MAX_FRAME_SIZE,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -19,10 +20,26 @@ fn endpoint_samples() -> Vec<Endpoint> {
     ]
 }
 
+fn identity_offer() -> IdentityOffer {
+    IdentityOffer {
+        id: "lokinet-primary".to_owned(),
+        address: Some(IdentityAddress::Domain("identity.loki".to_owned())),
+        capabilities: IdentityCapabilities {
+            send_streams: true,
+            send_datagrams: true,
+            receive_streams: true,
+            receive_datagrams: true,
+        },
+    }
+}
+
 #[test]
 fn endpoint_variants_round_trip() {
     for endpoint in endpoint_samples() {
-        let frame = Frame::OpenTcp { target: endpoint };
+        let frame = Frame::OpenStream {
+            identity: IdentitySelection::Any,
+            target: endpoint,
+        };
         assert_eq!(
             Frame::from_bytes(&frame.to_bytes().unwrap()).unwrap(),
             frame
@@ -32,6 +49,15 @@ fn endpoint_variants_round_trip() {
 
 #[test]
 fn all_protocol_frames_round_trip() {
+    let identity = identity_offer();
+    let lease = IdentityLease {
+        id: "lease-1".to_owned(),
+        identity: identity.clone(),
+    };
+    let identity_use = IdentityUse {
+        identity: identity.clone(),
+        lease_id: Some(lease.id.clone()),
+    };
     let frames = vec![
         Frame::Hello {
             version: 1,
@@ -41,26 +67,45 @@ fn all_protocol_frames_round_trip() {
             version: 1,
             max_frame_size: MAX_FRAME_SIZE as u32,
             capabilities: Capabilities {
-                tcp_connect: true,
-                udp_associate: true,
-                udp_bind: false,
-                endpoint_kinds: vec![
-                    EndpointKind::Socket,
-                    EndpointKind::Domain,
-                    EndpointKind::Service,
-                ],
                 max_datagram_size: MAX_DATAGRAM_SIZE as u32,
                 server_name: "test-backend".to_owned(),
             },
+            identities: vec![identity.clone()],
         },
-        Frame::OpenTcp {
+        Frame::IdentityOffersRequest,
+        Frame::IdentityOffers {
+            identities: vec![identity.clone()],
+        },
+        Frame::LeaseIdentity {
+            identity_id: Some(identity.id.clone()),
+        },
+        Frame::IdentityLeased {
+            lease: lease.clone(),
+        },
+        Frame::ReleaseIdentity {
+            lease_id: lease.id.clone(),
+        },
+        Frame::IdentityReleased,
+        Frame::OpenStream {
+            identity: IdentitySelection::Offer(identity.id.clone()),
             target: endpoint_samples()[0].clone(),
         },
-        Frame::TcpReady {
+        Frame::StreamReady {
+            identity: identity_use.clone(),
             source: Some(endpoint_samples()[1].clone()),
         },
-        Frame::OpenUdp { bind: None },
-        Frame::UdpReady {
+        Frame::AcceptStream {
+            identity: IdentitySelection::Lease(lease.id.clone()),
+        },
+        Frame::StreamAccepted {
+            identity: identity_use.clone(),
+            peer: endpoint_samples()[2].clone(),
+        },
+        Frame::OpenDatagrams {
+            identity: IdentitySelection::Lease(lease.id.clone()),
+        },
+        Frame::DatagramsReady {
+            identity: identity_use,
             bound: Some(endpoint_samples()[0].clone()),
         },
         Frame::Datagram {
@@ -97,6 +142,15 @@ fn rejects_malformed_and_oversized_frames() {
     assert!(Frame::Datagram {
         endpoint: Endpoint::Socket(SocketAddr::from(([127, 0, 0, 1], 53))),
         payload: vec![0; MAX_DATAGRAM_SIZE + 1],
+    }
+    .to_bytes()
+    .is_err());
+    assert!(Frame::IdentityOffers {
+        identities: vec![IdentityOffer {
+            id: String::new(),
+            address: None,
+            capabilities: IdentityCapabilities::default(),
+        }],
     }
     .to_bytes()
     .is_err());

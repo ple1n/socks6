@@ -1,4 +1,4 @@
-use socks6::{Client, Endpoint, Server, SocketBackend};
+use socks6::{Client, Endpoint, IdentitySelection, Server, SocketBackend};
 use std::{sync::Arc, time::Duration};
 use tokio::net::{TcpListener, UdpSocket};
 
@@ -12,10 +12,16 @@ async fn client_sends_and_receives_udp_datagrams() {
     let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let remote_addr = remote.local_addr().unwrap();
     let client = Client::connect(server_addr).await.unwrap();
-    assert!(client.query_capabilities().await.unwrap().udp_associate);
+    assert!(client
+        .query_identities()
+        .await
+        .unwrap()
+        .iter()
+        .any(|identity| identity.capabilities.send_datagrams));
     assert!(client.query_status().await.unwrap().connected);
 
-    let association = client.open_udp(None).await.unwrap();
+    let association = client.open_datagrams(IdentitySelection::Any).await.unwrap();
+    assert!(association.identity().lease_id.is_none());
     assert!(association.bound_endpoint().is_some());
     let payload = b"udp integration test".to_vec();
     association

@@ -1,22 +1,38 @@
 # SOCKS6
 
 SOCKS6 is an independent Rust crate and experimental wire protocol for
-requesting TCP streams and UDP associations from a proxy backend. It does not
-depend on nsproxy, Linux namespaces, or a particular network transport.
+negotiating proxy identities and leasing their capabilities. Clients can use
+leases to request reliable streams and unreliable datagrams through a proxy.
+The protocol does not depend on nsproxy, Linux namespaces, or a particular
+network backend.
 
 The crate provides:
 
 - A versioned, length-framed protocol that can run over TCP, Unix-domain
 streams, or another reliable byte stream.
-- A generic `Backend` interface for TCP connects, UDP associations, endpoint
-capabilities, and service status.
-- A `Client` API for opening TCP streams and bidirectional UDP associations.
+- Identity offers that describe the addresses and send/receive capabilities a
+backend can actually provide.
+- Explicit identity leases, which may be reused across requests and released
+when no longer needed.
+- A persistent identity negotiation session that can refresh offers and
+acquire or release leases repeatedly; data operations use separate carrier
+connections and can reuse those leases.
+- A generic `Backend` interface for reliable streams, unreliable datagrams,
+identity capabilities, and service status.
+- A `Client` API for querying offers, leasing identities, and opening streams
+or datagram channels with a selected lease, an offered identity, or a
+server-selected identity.
 - TCP and Unix-domain server listeners.
 - A direct-socket backend for examples and protocol tests.
 
+Here, **stream** and **datagram** describe application-level behavior: a stream
+is reliable and ordered; datagrams are discrete messages that may be lost or
+reordered. Those semantics do not require the backend or carrier to use TCP or
+UDP.
+
 A backend adapter implements `Backend`, keeping the protocol reusable and
-letting each backend advertise only the endpoint and operation types it
-actually supports.
+letting each backend advertise only the identities and capabilities it
+actually supports. See [SPEC.md](SPEC.md) for the version-2 wire contract.
 
 ## Example
 
@@ -29,7 +45,10 @@ use tokio::io::AsyncWriteExt;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proxy = Client::connect("127.0.0.1:1086".parse::<SocketAddr>()?).await?;
     let mut stream = proxy
-        .connect_tcp(Endpoint::Domain("example.com".to_owned(), 443))
+        .connect_stream(
+            Endpoint::Domain("example.com".to_owned(), 443),
+            socks6::IdentitySelection::Any,
+        )
         .await?;
     stream.write_all(b"request").await?;
     Ok(())
@@ -54,7 +73,7 @@ use socks6::Client;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proxy = Client::connect_unix("/run/example-socks6/proxy.socks6").await?;
-    println!("{:?}", proxy.query_capabilities().await?);
+    println!("{:?}", proxy.query_identities().await?);
     Ok(())
 }
 ```

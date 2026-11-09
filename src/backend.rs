@@ -1,5 +1,6 @@
-use crate::endpoint::{Endpoint, EndpointKind};
+use crate::endpoint::Endpoint;
 use crate::frame::{Capabilities, ErrorCode, MAX_DATAGRAM_SIZE};
+use crate::identity::{IdentityCapabilities, IdentityOffer};
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -35,7 +36,7 @@ impl BackendError {
 }
 
 #[async_trait]
-pub trait DatagramAssociation: Send + Sync {
+pub trait DatagramChannel: Send + Sync {
     fn bound_endpoint(&self) -> Option<Endpoint>;
     async fn send_to(&self, endpoint: Endpoint, payload: Vec<u8>) -> Result<(), BackendError>;
     async fn recv_from(&self) -> Result<Datagram, BackendError>;
@@ -51,6 +52,8 @@ pub struct Datagram {
 pub trait Backend: Send + Sync + 'static {
     fn capabilities(&self) -> Capabilities;
 
+    fn identity_offers(&self) -> Result<Vec<IdentityOffer>, BackendError>;
+
     fn status(&self) -> crate::frame::ServiceStatus {
         crate::frame::ServiceStatus {
             connected: true,
@@ -58,12 +61,25 @@ pub trait Backend: Send + Sync + 'static {
         }
     }
 
-    async fn connect_tcp(&self, target: Endpoint) -> Result<BoxStream, BackendError>;
-
-    async fn open_udp(
+    async fn connect_stream(
         &self,
-        bind: Option<Endpoint>,
-    ) -> Result<Box<dyn DatagramAssociation>, BackendError>;
+        identity: &IdentityOffer,
+        target: Endpoint,
+    ) -> Result<BoxStream, BackendError>;
+
+    async fn accept_stream(
+        &self,
+        _identity: &IdentityOffer,
+    ) -> Result<(BoxStream, Endpoint), BackendError> {
+        Err(BackendError::UnsupportedEndpoint(
+            "identity cannot receive reliable streams".to_owned(),
+        ))
+    }
+
+    async fn open_datagrams(
+        &self,
+        identity: &IdentityOffer,
+    ) -> Result<Box<dyn DatagramChannel>, BackendError>;
 }
 
 #[derive(Default)]
@@ -73,16 +89,35 @@ pub struct SocketBackend;
 impl Backend for SocketBackend {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            tcp_connect: true,
-            udp_associate: true,
-            udp_bind: true,
-            endpoint_kinds: vec![EndpointKind::Socket, EndpointKind::Ip, EndpointKind::Domain],
             max_datagram_size: MAX_DATAGRAM_SIZE as u32,
             server_name: "socks6-socket-backend".to_owned(),
         }
     }
 
-    async fn connect_tcp(&self, target: Endpoint) -> Result<BoxStream, BackendError> {
+    fn identity_offers(&self) -> Result<Vec<IdentityOffer>, BackendError> {
+        Ok(vec![IdentityOffer {
+            id: "default-egress".to_owned(),
+            address: None,
+            capabilities: IdentityCapabilities {
+                send_streams: true,
+                send_datagrams: true,
+                receive_streams: false,
+                receive_datagrams: false,
+            },
+        }])
+    }
+
+    async fn connect_stream(
+        &self,
+        identity: &IdentityOffer,
+        target: Endpoint,
+    ) -> Result<BoxStream, BackendError> {
+        if !identity.capabilities.send_streams {
+            return Err(BackendError::UnsupportedEndpoint(format!(
+                "identity {} cannot send reliable streams",
+                identity.id
+            )));
+        }
         let stream = match target {
             Endpoint::Socket(address) => TcpStream::connect(address).await,
             Endpoint::Domain(host, port) => TcpStream::connect((host.as_str(), port)).await,
@@ -99,28 +134,23 @@ impl Backend for SocketBackend {
         Ok(Box::new(stream))
     }
 
-    async fn open_udp(
+    async fn open_datagrams(
         &self,
-        bind: Option<Endpoint>,
-    ) -> Result<Box<dyn DatagramAssociation>, BackendError> {
-        let bind_addr = match bind {
-            None => "0.0.0.0:0"
+        identity: &IdentityOffer,
+    ) -> Result<Box<dyn DatagramChannel>, BackendError> {
+        if !identity.capabilities.send_datagrams {
+            return Err(BackendError::UnsupportedEndpoint(format!(
+                "identity {} cannot send unreliable datagrams",
+                identity.id
+            )));
+        }
+        let socket = UdpSocket::bind(
+            "0.0.0.0:0"
                 .parse::<SocketAddr>()
                 .expect("static socket address"),
-            Some(Endpoint::Socket(address)) => address,
-            Some(Endpoint::Ip(ip)) => SocketAddr::new(ip, 0),
-            Some(Endpoint::Domain(host, _)) => {
-                return Err(BackendError::InvalidEndpoint(format!(
-                    "cannot bind UDP to domain {host}"
-                )));
-            }
-            Some(Endpoint::Service { namespace, .. }) => {
-                return Err(BackendError::UnsupportedEndpoint(namespace));
-            }
-        };
-        let socket = UdpSocket::bind(bind_addr)
-            .await
-            .map_err(|error| BackendError::Unavailable(error.to_string()))?;
+        )
+        .await
+        .map_err(|error| BackendError::Unavailable(error.to_string()))?;
         let bound = socket
             .local_addr()
             .map_err(|error| BackendError::Internal(error.to_string()))?;
@@ -137,7 +167,7 @@ struct SocketDatagrams {
 }
 
 #[async_trait]
-impl DatagramAssociation for SocketDatagrams {
+impl DatagramChannel for SocketDatagrams {
     fn bound_endpoint(&self) -> Option<Endpoint> {
         Some(self.bound.clone())
     }
