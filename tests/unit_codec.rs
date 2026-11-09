@@ -96,6 +96,7 @@ fn all_protocol_frames_round_trip() {
         },
         Frame::AcceptStream {
             identity: IdentitySelection::Lease(lease.id.clone()),
+            port: 4321,
         },
         Frame::StreamAccepted {
             identity: identity_use.clone(),
@@ -151,6 +152,12 @@ fn rejects_malformed_and_oversized_frames() {
             address: None,
             capabilities: IdentityCapabilities::default(),
         }],
+    }
+    .to_bytes()
+    .is_err());
+    assert!(Frame::AcceptStream {
+        identity: IdentitySelection::Any,
+        port: 0,
     }
     .to_bytes()
     .is_err());

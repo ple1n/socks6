@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
-use tokio::io::{copy_bidirectional, split};
+use tokio::io::{copy_bidirectional, split, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::warn;
@@ -241,7 +241,7 @@ impl Server {
                     copy_bidirectional(&mut stream, &mut upstream).await?;
                     return Ok(());
                 }
-                Frame::AcceptStream { identity } => {
+                Frame::AcceptStream { identity, port } => {
                     let identity =
                         match self.resolve_identity(identity, |caps| caps.receive_streams) {
                             Ok(identity) => identity,
@@ -250,14 +250,34 @@ impl Server {
                                 return Ok(());
                             }
                         };
-                    let (mut incoming, peer) =
-                        match self.backend.accept_stream(&identity.identity).await {
-                            Ok(stream) => stream,
-                            Err(error) => {
-                                write_backend_error(&mut stream, error, max_frame_size).await?;
+                    let accepted = tokio::select! {
+                        accepted = self.backend.accept_stream(&identity.identity, port) => accepted,
+                        read = async {
+                            let mut byte = [0];
+                            stream.read(&mut byte).await
+                        } => match read {
+                            Ok(0) => return Ok(()),
+                            Ok(_) => {
+                                write_backend_error(
+                                    &mut stream,
+                                    BackendError::InvalidEndpoint(
+                                        "unexpected data while waiting for an incoming stream".to_owned(),
+                                    ),
+                                    max_frame_size,
+                                )
+                                .await?;
                                 return Ok(());
                             }
-                        };
+                            Err(error) => return Err(error.into()),
+                        }
+                    };
+                    let (mut incoming, peer) = match accepted {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            write_backend_error(&mut stream, error, max_frame_size).await?;
+                            return Ok(());
+                        }
+                    };
                     Frame::StreamAccepted { identity, peer }
                         .write_to_with_limit(&mut stream, max_frame_size)
                         .await?;

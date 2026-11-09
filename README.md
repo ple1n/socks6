@@ -32,7 +32,7 @@ UDP.
 
 A backend adapter implements `Backend`, keeping the protocol reusable and
 letting each backend advertise only the identities and capabilities it
-actually supports. See [SPEC.md](SPEC.md) for the version-2 wire contract.
+actually supports. See [SPEC.md](SPEC.md) for the version-3 wire contract.
 
 ## Example
 

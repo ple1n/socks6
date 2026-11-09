@@ -70,6 +70,7 @@ pub trait Backend: Send + Sync + 'static {
     async fn accept_stream(
         &self,
         _identity: &IdentityOffer,
+        _port: u16,
     ) -> Result<(BoxStream, Endpoint), BackendError> {
         Err(BackendError::UnsupportedEndpoint(
             "identity cannot receive reliable streams".to_owned(),

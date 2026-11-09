@@ -222,9 +222,13 @@ impl Client {
         }
     }
 
-    pub async fn accept_stream(&self, identity: IdentitySelection) -> Result<StreamConnection> {
+    pub async fn accept_stream(
+        &self,
+        identity: IdentitySelection,
+        port: u16,
+    ) -> Result<StreamConnection> {
         let (mut stream, _, _, max_frame_size) = self.open_session().await?;
-        Frame::AcceptStream { identity }
+        Frame::AcceptStream { identity, port }
             .write_to_with_limit(&mut stream, max_frame_size)
             .await?;
         match Frame::read_from_with_limit(&mut stream, max_frame_size).await? {
@@ -383,8 +387,12 @@ impl IdentitySession {
         self.client.connect_stream(target, identity).await
     }
 
-    pub async fn accept_stream(&self, identity: IdentitySelection) -> Result<StreamConnection> {
-        self.client.accept_stream(identity).await
+    pub async fn accept_stream(
+        &self,
+        identity: IdentitySelection,
+        port: u16,
+    ) -> Result<StreamConnection> {
+        self.client.accept_stream(identity, port).await
     }
 
     pub async fn open_datagrams(

@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAGIC: [u8; 2] = *b"S6";
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_DATAGRAM_SIZE: usize = 65_507;
 pub const MAX_IDENTITY_OFFERS: usize = 256;
@@ -67,6 +67,7 @@ pub enum Frame {
     },
     AcceptStream {
         identity: IdentitySelection,
+        port: u16,
     },
     StreamReady {
         identity: IdentityUse,
@@ -164,10 +165,11 @@ impl Frame {
                 encoder.identity_use(identity)?;
                 encoder.optional_endpoint(source.as_ref())?;
             }
-            Self::AcceptStream { identity } => {
+            Self::AcceptStream { identity, port } => {
                 encoder.u16(PROTOCOL_VERSION);
                 encoder.u8(20);
                 encoder.identity_selection(identity)?;
+                encoder.u16(*port);
             }
             Self::StreamAccepted { identity, peer } => {
                 encoder.u16(PROTOCOL_VERSION);
@@ -304,6 +306,7 @@ impl Frame {
                 ensure_version(version)?;
                 Self::AcceptStream {
                     identity: decoder.identity_selection()?,
+                    port: decoder.u16()?,
                 }
             }
             21 => {
@@ -464,7 +467,15 @@ impl Frame {
                 identity.validate()?;
                 source.as_ref().map_or(Ok(()), check_endpoint)
             }
-            Self::AcceptStream { identity } => identity.validate(),
+            Self::AcceptStream { identity, port } => {
+                identity.validate()?;
+                if *port == 0 {
+                    return Err(Error::Protocol(
+                        "incoming stream port must be nonzero".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
             Self::StreamAccepted { identity, peer } => {
                 identity.validate()?;
                 check_endpoint(peer)

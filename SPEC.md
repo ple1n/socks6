@@ -1,9 +1,9 @@
 # SOCKS6 protocol
 
-Version 2 is an experimental, backend-neutral protocol for offering proxy
+Version 3 is an experimental, backend-neutral protocol for offering proxy
 identities and leasing their capabilities. A client can use a lease for
 outbound requests and for any inbound handling the offered identity supports.
-Version 2 is a breaking change from version 1.
+Version 3 is a breaking change from version 2.
 
 SOCKS6 is not tied to nsproxy, a particular operating system, or one network
 backend. A server may expose the protocol over any reliable byte stream. The
@@ -85,7 +85,7 @@ u8 opcode
 opcode-specific fields
 ```
 
-Version 2 uses the field encodings below. Integers are unsigned and
+Version 3 uses the field encodings below. Integers are unsigned and
 big-endian. Strings are UTF-8 preceded by a `u16` byte length. Byte strings are
 preceded by a `u32` length. Booleans are one byte (`0` or `1`). Optional
 values are a one-byte presence flag followed by the value when present.
@@ -165,12 +165,16 @@ and an optional source endpoint. From then on, the carrier
 connection carries unframed, bidirectional stream bytes until either side
 closes. If setup fails, the server sends `Error`.
 
-`AcceptStream` (opcode `20`) contains an identity selection for an identity
-whose offer has `receive_streams` enabled. The server waits for one incoming
-stream and replies with `StreamAccepted` (opcode `21`), containing the effective
-identity use and the incoming peer endpoint. The carrier then relays that stream until
-either side closes. The client can issue another `AcceptStream` request with
-the same lease to wait for another incoming stream.
+`AcceptStream` (opcode `20`) contains an identity selection and a nonzero
+`u16` incoming service port for an identity whose offer has `receive_streams`
+enabled. The caller must make the identity and port known to peers that will
+connect to it. The server waits for one incoming stream and replies with
+`StreamAccepted` (opcode `21`), containing the effective identity use and the
+incoming peer endpoint. The Lokinet backend encodes a peer identity as a
+service endpoint in the `lokinet-peer` namespace because Lokinet does not
+expose a source port for incoming streams. The carrier then relays that stream
+until either side closes. The client can issue another `AcceptStream` request
+with the same lease and port to wait for another incoming stream.
 
 ### Unreliable datagrams
 
