@@ -1,4 +1,5 @@
 use crate::frame::ErrorCode;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -14,6 +15,14 @@ pub enum Error {
 
     #[error("server returned {code:?}: {message}")]
     Remote { code: ErrorCode, message: String },
+
+    #[error("server connection failed during {phase:?}: {code:?}: {message}")]
+    ConnectFailed {
+        code: ErrorCode,
+        message: String,
+        phase: Option<String>,
+        retry_after: Option<Duration>,
+    },
 
     #[error("connection closed")]
     ConnectionClosed,

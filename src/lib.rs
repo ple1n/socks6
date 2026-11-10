@@ -6,7 +6,10 @@ pub mod frame;
 pub mod identity;
 pub mod server;
 
-pub use backend::{Backend, BackendError, BoxStream, Datagram, DatagramChannel, SocketBackend};
+pub use backend::{
+    Backend, BackendError, BoxStream, ConnectContext, ConnectProgress, Datagram, DatagramChannel,
+    SocketBackend,
+};
 #[cfg(unix)]
 pub use client::UnixConnector;
 pub use client::{
@@ -15,8 +18,8 @@ pub use client::{
 pub use endpoint::{Endpoint, EndpointKind};
 pub use error::{Error, Result};
 pub use frame::{
-    Capabilities, ErrorCode, Frame, ServiceStatus, MAX_DATAGRAM_SIZE, MAX_FRAME_SIZE,
-    PROTOCOL_VERSION,
+    Capabilities, ErrorCode, Frame, ServiceStatus, MAX_CONNECT_PHASE_LENGTH, MAX_DATAGRAM_SIZE,
+    MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 pub use identity::{
     IdentityAddress, IdentityCapabilities, IdentityLease, IdentityOffer, IdentitySelection,

@@ -125,6 +125,16 @@ fn all_protocol_frames_round_trip() {
             code: ErrorCode::Unavailable,
             message: "route not ready".to_owned(),
         },
+        Frame::ConnectProgress {
+            phase: "establishing_route".to_owned(),
+            detail: Some("waiting for a usable route".to_owned()),
+        },
+        Frame::ConnectFailed {
+            code: ErrorCode::Unavailable,
+            message: "connection attempt timed out".to_owned(),
+            phase: Some("connecting_target".to_owned()),
+            retry_after_ms: Some(1000),
+        },
     ];
 
     for frame in frames {
@@ -158,6 +168,12 @@ fn rejects_malformed_and_oversized_frames() {
     assert!(Frame::AcceptStream {
         identity: IdentitySelection::Any,
         port: 0,
+    }
+    .to_bytes()
+    .is_err());
+    assert!(Frame::ConnectProgress {
+        phase: String::new(),
+        detail: None,
     }
     .to_bytes()
     .is_err());

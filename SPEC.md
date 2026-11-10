@@ -1,9 +1,9 @@
 # SOCKS6 protocol
 
-Version 3 is an experimental, backend-neutral protocol for offering proxy
+Version 4 is an experimental, backend-neutral protocol for offering proxy
 identities and leasing their capabilities. A client can use a lease for
 outbound requests and for any inbound handling the offered identity supports.
-Version 3 is a breaking change from version 2.
+Version 4 is a breaking change from version 3.
 
 SOCKS6 is not tied to nsproxy, a particular operating system, or one network
 backend. A server may expose the protocol over any reliable byte stream. The
@@ -85,7 +85,7 @@ u8 opcode
 opcode-specific fields
 ```
 
-Version 3 uses the field encodings below. Integers are unsigned and
+Version 4 uses the field encodings below. Integers are unsigned and
 big-endian. Strings are UTF-8 preceded by a `u16` byte length. Byte strings are
 preceded by a `u32` length. Booleans are one byte (`0` or `1`). Optional
 values are a one-byte presence flag followed by the value when present.
@@ -160,10 +160,25 @@ carrier connections and reuse the same lease.
 ### Reliable stream
 
 `OpenStream` (opcode `9`) contains an identity selection and a target endpoint.
-On success the server sends `StreamReady` (opcode `10`) with the identity use
-and an optional source endpoint. From then on, the carrier
-connection carries unframed, bidirectional stream bytes until either side
-closes. If setup fails, the server sends `Error`.
+The server may send zero or more `ConnectProgress` (opcode `22`) frames while
+the connection is being established. A progress phase is an opaque,
+backend-defined string; it describes the current attempt and is not a retry
+instruction. On success the server sends `StreamReady` (opcode `10`) with the
+identity use and an optional source endpoint. The backend must not report
+success until the requested stream is usable according to its connection
+semantics. From then on, the carrier connection carries unframed, bidirectional
+stream bytes until either side closes.
+
+If setup fails, the server sends `ConnectFailed` (opcode `23`) with an error
+code, message, optional phase, and optional `retry_after_ms`. Retry guidance is
+terminal metadata: it is sent only after the attempt has failed, and clients
+must not retry while the original attempt is still in progress. Closing the
+carrier before a terminal result cancels the request.
+
+`ConnectProgress` contains a string phase and optional string detail.
+`ConnectFailed` contains a `u8` error code, string message, optional string
+phase, and optional `u32 retry_after_ms`. It uses the same error codes as
+`Error` (opcode `19`); its phase and retry delay are informational metadata.
 
 `AcceptStream` (opcode `20`) contains an identity selection and a nonzero
 `u16` incoming service port for an identity whose offer has `receive_streams`
@@ -206,6 +221,9 @@ connected flag and optional detail string. `Ping` (opcode `16`) receives
 are invalid request `1`, unsupported `2`, unavailable `3`, limit exceeded `4`,
 internal `5`, and version mismatch `6`. The server closes the request after an
 error unless it occurred during the initial handshake.
+
+`ConnectFailed` (opcode `23`) uses these same error codes for stream setup
+failures.
 
 ## Target endpoint encoding
 

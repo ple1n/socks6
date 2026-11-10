@@ -1,4 +1,6 @@
-use crate::backend::{AsyncStream, Backend, BackendError, DatagramChannel};
+use crate::backend::{
+    AsyncStream, Backend, BackendError, ConnectContext, ConnectProgress, DatagramChannel,
+};
 use crate::error::{Error, Result};
 use crate::frame::{ErrorCode, Frame, MAX_FRAME_SIZE, PROTOCOL_VERSION};
 use crate::identity::IdentityUse;
@@ -7,9 +9,11 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{copy_bidirectional, split, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::time::{sleep_until, Instant};
 use tracing::warn;
 
 const MAX_ACTIVE_IDENTITY_LEASES: usize = 4096;
@@ -46,6 +50,7 @@ impl Listener for UnixListener {
 pub struct Server {
     backend: Arc<dyn Backend>,
     max_frame_size: usize,
+    connect_timeout: Duration,
     connection_slots: Arc<Semaphore>,
     identity_leases: Arc<Mutex<IdentityLeaseState>>,
 }
@@ -64,6 +69,7 @@ impl Server {
         Self {
             backend: Arc::new(backend),
             max_frame_size: MAX_FRAME_SIZE,
+            connect_timeout: Duration::from_secs(30),
             connection_slots: Arc::new(Semaphore::new(1024)),
             identity_leases: Arc::new(Mutex::new(IdentityLeaseState::default())),
         }
@@ -73,6 +79,7 @@ impl Server {
         Self {
             backend,
             max_frame_size: MAX_FRAME_SIZE,
+            connect_timeout: Duration::from_secs(30),
             connection_slots: Arc::new(Semaphore::new(1024)),
             identity_leases: Arc::new(Mutex::new(IdentityLeaseState::default())),
         }
@@ -95,6 +102,17 @@ impl Server {
             ));
         }
         self.connection_slots = Arc::new(Semaphore::new(max_connections));
+        Ok(self)
+    }
+
+    /// Sets the maximum time spent establishing an outbound stream.
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Result<Self> {
+        if timeout.is_zero() {
+            return Err(Error::Protocol(
+                "connection timeout must be nonzero".to_owned(),
+            ));
+        }
+        self.connect_timeout = timeout;
         Ok(self)
     }
 
@@ -221,14 +239,95 @@ impl Server {
                             return Ok(());
                         }
                     };
-                    let mut upstream = match self
-                        .backend
-                        .connect_stream(&identity.identity, target)
-                        .await
-                    {
-                        Ok(stream) => stream,
+                    let deadline = Instant::now() + self.connect_timeout;
+                    let (cancelled_tx, cancelled_rx) = watch::channel(false);
+                    let (progress_tx, mut progress_rx) = mpsc::channel(16);
+                    let context = ConnectContext::new(deadline, cancelled_rx, progress_tx);
+                    let backend_identity = identity.identity.clone();
+                    let connect = self.backend.connect_stream_with_context(
+                        &backend_identity,
+                        target,
+                        context,
+                    );
+                    tokio::pin!(connect);
+                    let mut progress_open = true;
+                    let mut unexpected_data = [0; 1];
+                    let connect_result = loop {
+                        enum ConnectEvent {
+                            Complete(std::result::Result<crate::backend::BoxStream, BackendError>),
+                            Progress(Option<ConnectProgress>),
+                            ClientRead(io::Result<usize>),
+                            Timeout,
+                        }
+
+                        let event = tokio::select! {
+                            result = &mut connect => ConnectEvent::Complete(result),
+                            progress = progress_rx.recv(), if progress_open => {
+                                ConnectEvent::Progress(progress)
+                            }
+                            read = stream.read(&mut unexpected_data) => ConnectEvent::ClientRead(read),
+                            _ = sleep_until(deadline) => ConnectEvent::Timeout,
+                        };
+
+                        match event {
+                            ConnectEvent::Complete(result) => break result,
+                            ConnectEvent::Progress(Some(progress)) => {
+                                if let Err(error) = (Frame::ConnectProgress {
+                                    phase: progress.phase,
+                                    detail: progress.detail,
+                                })
+                                .write_to_with_limit(&mut stream, max_frame_size)
+                                .await
+                                {
+                                    let _ = cancelled_tx.send(true);
+                                    return Err(error);
+                                }
+                            }
+                            ConnectEvent::Progress(None) => progress_open = false,
+                            ConnectEvent::ClientRead(Ok(0)) => {
+                                let _ = cancelled_tx.send(true);
+                                return Ok(());
+                            }
+                            ConnectEvent::ClientRead(Ok(_)) => {
+                                let _ = cancelled_tx.send(true);
+                                Frame::Error {
+                                    code: ErrorCode::InvalidRequest,
+                                    message: "client sent stream data before StreamReady"
+                                        .to_owned(),
+                                }
+                                .write_to_with_limit(&mut stream, max_frame_size)
+                                .await?;
+                                return Ok(());
+                            }
+                            ConnectEvent::ClientRead(Err(error)) => {
+                                let _ = cancelled_tx.send(true);
+                                return Err(error.into());
+                            }
+                            ConnectEvent::Timeout => {
+                                let _ = cancelled_tx.send(true);
+                                break Err(BackendError::ConnectFailure {
+                                    code: ErrorCode::Unavailable,
+                                    message: "connection attempt timed out".to_owned(),
+                                    phase: Some("connecting".to_owned()),
+                                    retry_after: Some(Duration::from_secs(1)),
+                                });
+                            }
+                        }
+                    };
+                    let mut upstream = match connect_result {
+                        Ok(upstream) => upstream,
                         Err(error) => {
-                            write_backend_error(&mut stream, error, max_frame_size).await?;
+                            let (code, message, phase, retry_after) = error.connection_failure();
+                            let retry_after_ms = retry_after
+                                .map(|duration| duration.as_millis().min(u32::MAX as u128) as u32);
+                            Frame::ConnectFailed {
+                                code,
+                                message,
+                                phase,
+                                retry_after_ms,
+                            }
+                            .write_to_with_limit(&mut stream, max_frame_size)
+                            .await?;
                             return Ok(());
                         }
                     };

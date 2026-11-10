@@ -18,10 +18,12 @@ when no longer needed.
 acquire or release leases repeatedly; data operations use separate carrier
 connections and can reuse those leases.
 - A generic `Backend` interface for reliable streams, unreliable datagrams,
-identity capabilities, and service status.
+identity capabilities, and service status. Stream setup receives a deadline,
+cancellation signal, and optional backend-defined progress reporting.
 - A `Client` API for querying offers, leasing identities, and opening streams
 or datagram channels with a selected lease, an offered identity, or a
-server-selected identity.
+server-selected identity. Stream clients may opt into connection-progress
+callbacks while the server is still establishing the requested connection.
 - TCP and Unix-domain server listeners.
 - A direct-socket backend for examples and protocol tests.
 
@@ -32,7 +34,7 @@ UDP.
 
 A backend adapter implements `Backend`, keeping the protocol reusable and
 letting each backend advertise only the identities and capabilities it
-actually supports. See [SPEC.md](SPEC.md) for the version-3 wire contract.
+actually supports. See [SPEC.md](SPEC.md) for the version-4 wire contract.
 
 ## Example
 

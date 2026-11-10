@@ -3,8 +3,11 @@ use crate::frame::{Capabilities, ErrorCode, MAX_DATAGRAM_SIZE};
 use crate::identity::{IdentityCapabilities, IdentityOffer};
 use async_trait::async_trait;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
 
@@ -20,6 +23,14 @@ pub enum BackendError {
     InvalidEndpoint(String),
     #[error("backend unavailable: {0}")]
     Unavailable(String),
+    /// Terminal connection failure with optional phase and retry guidance.
+    #[error("{message}")]
+    ConnectFailure {
+        code: ErrorCode,
+        message: String,
+        phase: Option<String>,
+        retry_after: Option<Duration>,
+    },
     #[error("backend failure: {0}")]
     Internal(String),
 }
@@ -30,8 +41,86 @@ impl BackendError {
             Self::UnsupportedEndpoint(_) => ErrorCode::Unsupported,
             Self::InvalidEndpoint(_) => ErrorCode::InvalidRequest,
             Self::Unavailable(_) => ErrorCode::Unavailable,
+            Self::ConnectFailure { code, .. } => *code,
             Self::Internal(_) => ErrorCode::Internal,
         }
+    }
+
+    pub(crate) fn connection_failure(
+        &self,
+    ) -> (ErrorCode, String, Option<String>, Option<Duration>) {
+        match self {
+            Self::ConnectFailure {
+                code,
+                message,
+                phase,
+                retry_after,
+            } => (*code, message.clone(), phase.clone(), *retry_after),
+            _ => (self.code(), self.to_string(), None, None),
+        }
+    }
+}
+
+/// Advisory backend-defined status for an in-progress stream connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectProgress {
+    pub phase: String,
+    pub detail: Option<String>,
+}
+
+impl ConnectProgress {
+    pub fn new(phase: impl Into<String>) -> Self {
+        Self {
+            phase: phase.into(),
+            detail: None,
+        }
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
+/// Deadline, cancellation signal, and progress channel for one connection attempt.
+#[derive(Clone)]
+pub struct ConnectContext {
+    deadline: Instant,
+    cancelled: watch::Receiver<bool>,
+    progress: mpsc::Sender<ConnectProgress>,
+}
+
+impl ConnectContext {
+    pub(crate) fn new(
+        deadline: Instant,
+        cancelled: watch::Receiver<bool>,
+        progress: mpsc::Sender<ConnectProgress>,
+    ) -> Self {
+        Self {
+            deadline,
+            cancelled,
+            progress,
+        }
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Resolves when the request is cancelled or the server drops its connection context.
+    pub async fn cancelled(&self) {
+        let mut cancelled = self.cancelled.clone();
+        if !*cancelled.borrow() {
+            let _ = cancelled.changed().await;
+        }
+    }
+
+    /// Reports an in-progress phase; retry metadata belongs on a terminal error.
+    pub async fn report_progress(
+        &self,
+        progress: ConnectProgress,
+    ) -> std::result::Result<(), ConnectProgress> {
+        self.progress.send(progress).await.map_err(|error| error.0)
     }
 }
 
@@ -61,11 +150,24 @@ pub trait Backend: Send + Sync + 'static {
         }
     }
 
+    /// Connects to the target and returns only once the stream is usable.
     async fn connect_stream(
         &self,
         identity: &IdentityOffer,
         target: Endpoint,
     ) -> Result<BoxStream, BackendError>;
+
+    /// Context-aware connection hook. Existing backends can keep implementing
+    /// `connect_stream`; backends needing progress or cooperative cancellation
+    /// can override this method.
+    async fn connect_stream_with_context(
+        &self,
+        identity: &IdentityOffer,
+        target: Endpoint,
+        _context: ConnectContext,
+    ) -> Result<BoxStream, BackendError> {
+        self.connect_stream(identity, target).await
+    }
 
     async fn accept_stream(
         &self,

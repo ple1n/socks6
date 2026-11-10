@@ -1,4 +1,4 @@
-use crate::backend::{BoxStream, Datagram};
+use crate::backend::{BoxStream, ConnectProgress, Datagram};
 use crate::endpoint::Endpoint;
 use crate::error::{Error, Result};
 use crate::frame::{
@@ -201,6 +201,21 @@ impl Client {
         target: Endpoint,
         identity: IdentitySelection,
     ) -> Result<StreamConnection> {
+        self.connect_stream_with_progress(target, identity, |_| {})
+            .await
+    }
+
+    /// Opens a stream and invokes `on_progress` for backend-defined phases
+    /// until the stream is ready or the attempt fails.
+    pub async fn connect_stream_with_progress<F>(
+        &self,
+        target: Endpoint,
+        identity: IdentitySelection,
+        mut on_progress: F,
+    ) -> Result<StreamConnection>
+    where
+        F: FnMut(ConnectProgress) + Send,
+    {
         let (mut stream, _, _, max_frame_size) = self.open_session().await?;
         Frame::OpenStream {
             identity,
@@ -208,17 +223,41 @@ impl Client {
         }
         .write_to(&mut stream)
         .await?;
-        match Frame::read_from_with_limit(&mut stream, max_frame_size).await? {
-            Frame::StreamReady { identity, source } => Ok(StreamConnection {
-                stream,
-                target,
-                source,
-                identity,
-            }),
-            Frame::Error { code, message } => Err(Error::Remote { code, message }),
-            _ => Err(Error::Protocol(
-                "expected StreamReady from the server".to_owned(),
-            )),
+        loop {
+            match Frame::read_from_with_limit(&mut stream, max_frame_size).await? {
+                Frame::ConnectProgress { phase, detail } => {
+                    on_progress(ConnectProgress { phase, detail })
+                }
+                Frame::StreamReady { identity, source } => {
+                    return Ok(StreamConnection {
+                        stream,
+                        target,
+                        source,
+                        identity,
+                    });
+                }
+                Frame::ConnectFailed {
+                    code,
+                    message,
+                    phase,
+                    retry_after_ms,
+                } => {
+                    return Err(Error::ConnectFailed {
+                        code,
+                        message,
+                        phase,
+                        retry_after: retry_after_ms.map(|milliseconds| {
+                            std::time::Duration::from_millis(u64::from(milliseconds))
+                        }),
+                    });
+                }
+                Frame::Error { code, message } => return Err(Error::Remote { code, message }),
+                _ => {
+                    return Err(Error::Protocol(
+                        "expected connection progress or StreamReady from the server".to_owned(),
+                    ));
+                }
+            }
         }
     }
 
@@ -385,6 +424,21 @@ impl IdentitySession {
         identity: IdentitySelection,
     ) -> Result<StreamConnection> {
         self.client.connect_stream(target, identity).await
+    }
+
+    /// Opens a stream through this identity session and reports setup progress.
+    pub async fn connect_stream_with_progress<F>(
+        &self,
+        target: Endpoint,
+        identity: IdentitySelection,
+        on_progress: F,
+    ) -> Result<StreamConnection>
+    where
+        F: FnMut(ConnectProgress) + Send,
+    {
+        self.client
+            .connect_stream_with_progress(target, identity, on_progress)
+            .await
     }
 
     pub async fn accept_stream(

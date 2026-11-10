@@ -8,10 +8,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAGIC: [u8; 2] = *b"S6";
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_DATAGRAM_SIZE: usize = 65_507;
 pub const MAX_IDENTITY_OFFERS: usize = 256;
+pub const MAX_CONNECT_PHASE_LENGTH: usize = 128;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Capabilities {
@@ -96,6 +97,16 @@ pub enum Frame {
     Error {
         code: ErrorCode,
         message: String,
+    },
+    ConnectProgress {
+        phase: String,
+        detail: Option<String>,
+    },
+    ConnectFailed {
+        code: ErrorCode,
+        message: String,
+        phase: Option<String>,
+        retry_after_ms: Option<u32>,
     },
 }
 
@@ -221,6 +232,25 @@ impl Frame {
                 encoder.u8(19);
                 encoder.u8(error_code_to_wire(*code));
                 encoder.string(message)?;
+            }
+            Self::ConnectProgress { phase, detail } => {
+                encoder.u16(PROTOCOL_VERSION);
+                encoder.u8(22);
+                encoder.string(phase)?;
+                encoder.optional_string(detail.as_deref())?;
+            }
+            Self::ConnectFailed {
+                code,
+                message,
+                phase,
+                retry_after_ms,
+            } => {
+                encoder.u16(PROTOCOL_VERSION);
+                encoder.u8(23);
+                encoder.u8(error_code_to_wire(*code));
+                encoder.string(message)?;
+                encoder.optional_string(phase.as_deref())?;
+                encode_optional_u32(&mut encoder, *retry_after_ms);
             }
         }
         if encoder.bytes.len() > MAX_FRAME_SIZE {
@@ -366,6 +396,22 @@ impl Frame {
                     message: decoder.string()?,
                 }
             }
+            22 => {
+                ensure_version(version)?;
+                Self::ConnectProgress {
+                    phase: decoder.string()?,
+                    detail: decoder.optional_string()?,
+                }
+            }
+            23 => {
+                ensure_version(version)?;
+                Self::ConnectFailed {
+                    code: error_code_from_wire(decoder.u8()?)?,
+                    message: decoder.string()?,
+                    phase: decoder.optional_string()?,
+                    retry_after_ms: decode_optional_u32(&mut decoder)?,
+                }
+            }
             _ => {
                 return Err(Error::Protocol(format!(
                     "unknown SOCKS6 frame opcode {opcode}"
@@ -497,6 +543,33 @@ impl Frame {
             }
             Self::Error { message, .. } if message.len() > 4096 => {
                 Err(Error::Protocol("error message is too long".to_owned()))
+            }
+            Self::ConnectProgress { phase, detail, .. } => {
+                if phase.is_empty() || phase.len() > MAX_CONNECT_PHASE_LENGTH {
+                    return Err(Error::Protocol(format!(
+                        "connection phase must contain 1 to {MAX_CONNECT_PHASE_LENGTH} bytes"
+                    )));
+                }
+                if detail.as_ref().is_some_and(|detail| detail.len() > 4096) {
+                    return Err(Error::Protocol(
+                        "connection progress detail is too long".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::ConnectFailed { message, phase, .. } => {
+                if message.len() > 4096 {
+                    return Err(Error::Protocol("error message is too long".to_owned()));
+                }
+                if phase
+                    .as_ref()
+                    .is_some_and(|phase| phase.is_empty() || phase.len() > MAX_CONNECT_PHASE_LENGTH)
+                {
+                    return Err(Error::Protocol(format!(
+                        "connection phase must contain 1 to {MAX_CONNECT_PHASE_LENGTH} bytes"
+                    )));
+                }
+                Ok(())
             }
             Self::Status(ServiceStatus {
                 detail: Some(detail),
@@ -717,6 +790,24 @@ impl Encoder {
             }
         }
         Ok(())
+    }
+}
+
+fn encode_optional_u32(encoder: &mut Encoder, value: Option<u32>) {
+    match value {
+        Some(value) => {
+            encoder.u8(1);
+            encoder.u32(value);
+        }
+        None => encoder.u8(0),
+    }
+}
+
+fn decode_optional_u32(decoder: &mut Decoder<'_>) -> Result<Option<u32>> {
+    match decoder.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(decoder.u32()?)),
+        value => Err(Error::Protocol(format!("unknown optional u32 tag {value}"))),
     }
 }
 
